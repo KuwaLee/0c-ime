@@ -47,11 +47,12 @@ type PunctWorker struct {
 }
 
 type punctProc struct {
-	cmd    *exec.Cmd
-	input  io.WriteCloser
-	output *bufio.Scanner
-	done   chan struct{}
-	accel  string // worker 就緒時回報實際使用的裝置
+	cmd      *exec.Cmd
+	input    io.WriteCloser
+	output   *bufio.Scanner
+	done     chan struct{}
+	accel    string // worker 就緒時回報實際使用的裝置
+	provider string // 加速時用的 provider；CPU 時為空
 }
 
 func OpenPunct(c PunctConfig) (*PunctWorker, error) {
@@ -161,10 +162,11 @@ func launchPunct(command func() *exec.Cmd, model string) (*punctProc, error) {
 	go func() { _ = cmd.Wait(); close(p.done) }()
 	b, err := p.exchange(nil, 20*time.Second)
 	var ready struct {
-		Ready  bool   `json:"ready"`
-		Schema string `json:"schema"`
-		Model  string `json:"model_sha256"`
-		Accel  string `json:"accel"`
+		Ready    bool   `json:"ready"`
+		Schema   string `json:"schema"`
+		Model    string `json:"model_sha256"`
+		Accel    string `json:"accel"`
+		Provider string `json:"accel_provider"`
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &ready)
@@ -176,6 +178,7 @@ func launchPunct(command func() *exec.Cmd, model string) (*punctProc, error) {
 	}
 	stderr.finish()
 	p.accel = readyAccel(ready.Accel)
+	p.provider = readyProvider(p.accel, ready.Provider)
 	return p, nil
 }
 
@@ -308,6 +311,16 @@ func (w *PunctWorker) Accel() string {
 		return ""
 	}
 	return w.proc.accel
+}
+
+// Provider 回報目前 worker 加速時用的 provider；沒有可用的 worker 或 CPU 時為空字串。
+func (w *PunctWorker) Provider() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.proc == nil {
+		return ""
+	}
+	return w.proc.provider
 }
 
 func (w *PunctWorker) State() string {

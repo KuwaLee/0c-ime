@@ -69,7 +69,7 @@ func serve() string {
 	neuralWorker := flag.String("neural-worker", "", "worker 腳本路徑（encoder_runtime.py 或 sequence_runtime.py）")
 	neuralTimeout := flag.Duration("neural-timeout", 100*time.Millisecond, "模型決策期限，上限 100ms；逾時保留原排序")
 	neuralThreads := flag.Int("neural-threads", neural.DefaultThreads(), "模型 CPU threads（1–8，預設為 CPU 邏輯核心數，最多 8）")
-	neuralAccel := flag.String("neural-accel", settings.AccelCPU, "神經選字的硬體加速：cpu、gpu 或 npu（Intel 內顯／NPU，需 onnxruntime 的 OpenVINO EP；無法使用時照舊走 CPU）；未指定時依 settings.json 的「硬體加速」")
+	neuralAccel := flag.String("neural-accel", settings.AccelCPU, "神經選字與補標點的硬體加速：cpu、gpu（顯示卡：CUDA、MIGraphX、ROCm、DirectML 或 OpenVINO，依安裝的 onnxruntime）或 npu（Intel NPU）；無法使用時照舊走 CPU；未指定時依 settings.json 的「硬體加速」")
 	punctPackage := flag.String("punct-package", "", "提交時補標點 ONNX 包；未指定時依 settings.json 使用資料包旁內附的 neural/punct")
 	punctWorker := flag.String("punct-worker", "", "補標點 worker 腳本路徑（punct_runtime.py）；Python 同 -neural-python")
 	punctTimeout := flag.Duration("punct-timeout", 150*time.Millisecond, "補標點期限，上限 500ms；逾時照原文提交")
@@ -548,10 +548,16 @@ func serve() string {
 			if accel := selectionWorker.Accel(); accel != "" {
 				info["selection_accel"] = accel
 			}
+			if provider := selectionWorker.Provider(); provider != "" {
+				info["selection_accel_provider"] = provider
+			}
 		}
 		if punctuationState == "ready" && punctuationWorker != nil {
 			if accel := punctuationWorker.Accel(); accel != "" {
 				info["punctuation_accel"] = accel
+			}
+			if provider := punctuationWorker.Provider(); provider != "" {
+				info["punctuation_accel_provider"] = provider
 			}
 		}
 		if selectionState == "fallback" && selectionWorker != nil && selectionWorker.Reason() != "" {

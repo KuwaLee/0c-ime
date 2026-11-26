@@ -25,7 +25,7 @@ func modelStatus(dial autoupdate.Dialer) map[string]any {
 		}
 		state[key] = value
 	}
-	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel", "punctuation_accel"} {
+	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel", "punctuation_accel", "selection_accel_provider", "punctuation_accel_provider"} {
 		if info[key] != "" {
 			state[key] = info[key]
 		}
@@ -47,8 +47,8 @@ func printModelStatus(w io.Writer, state map[string]any) {
 		fmt.Fprintln(w, "暫時無法查詢模型運作狀態。")
 	default:
 		fmt.Fprintf(w, "模型運作狀態（引擎 %s）：\n神經選字：%s\n補標點：%s\n",
-			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"])+accelLabel(state["selection_accel"]),
-			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"])+accelLabel(state["punctuation_accel"]))
+			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"])+accelLabel(state["selection_accel"], state["selection_accel_provider"]),
+			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"])+accelLabel(state["punctuation_accel"], state["punctuation_accel_provider"]))
 	}
 }
 
@@ -106,13 +106,20 @@ func reasonLabel(value any) string {
 	return ""
 }
 
-// accelLabel 說明神經選字實際使用的硬體加速（health 的 selection_accel）；CPU 或舊引擎沒有回報時不加字。
-func accelLabel(value any) string {
+// accelLabel 說明模型實際使用的硬體加速（health 的 *_accel 與 *_accel_provider）；CPU 或舊引擎沒有回報時不加字。
+func accelLabel(value, provider any) string {
+	name := providerNames[fmt.Sprint(provider)]
 	switch value {
 	case "gpu":
-		return "（Intel 內顯加速）"
+		if name == "" {
+			return "（GPU 加速）"
+		}
+		return "（GPU 加速，" + name + "）"
 	case "npu":
-		return "（Intel NPU 加速）"
+		return "（NPU 加速，Intel OpenVINO）"
 	}
 	return ""
 }
+
+// providerNames 是 provider 代碼的顯示名稱（與設定程式的 ACCEL_PROVIDER 相同）。
+var providerNames = map[string]string{"cuda": "NVIDIA CUDA", "migraphx": "AMD MIGraphX", "rocm": "AMD ROCm", "directml": "DirectML", "openvino": "Intel OpenVINO"}

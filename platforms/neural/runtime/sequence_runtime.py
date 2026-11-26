@@ -48,6 +48,8 @@ NPU_LENGTHS = (128, 256)
 NPU_PROJ = (8, 16, 24)
 NPU_ROWS = 256
 NPU_SHAPES = tuple((L, u) for L in NPU_LENGTHS for u in NPU_PROJ)
+# GPU 每次最多等這麼久（秒），沒等到就這一次用 CPU：宿主期限 100 ms，CPU 評分在慢的機器上也要留時間。
+GPU_BUDGET = 0.03
 
 
 def sha(path):
@@ -255,6 +257,20 @@ class NPU:
         return unpad_scores(raw, inputs)
 
 
+# >>> accel-shared：sequence_runtime.py 與 punct_runtime.py 逐字相同（worker 以 -I 執行，不能 import 同目錄的模組；
+# internal/neural 的 TestAccelSharedBlockIdentical 核對）。
+GPU_PROVIDERS = (
+    # 依序試，第一個建得起來的就用。一律 FP32：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN。
+    # 不用 TensorRT：每個新形狀都要建引擎（數秒以上），遠超過宿主的期限。
+    ('cuda', 'CUDAExecutionProvider', {'use_tf32': '0'}),   # NVIDIA；TF32 只有 10 位尾數，關掉以保持 FP32 結果
+    ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm）
+    ('rocm', 'ROCMExecutionProvider', {}),                  # AMD（舊版 onnxruntime-rocm）
+    ('directml', 'DmlExecutionProvider', {}),               # Windows，任何 DirectX 12 顯示卡
+    ('openvino', 'OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'}),   # Intel
+)
+GPU_MAX_ERRORS = 3
+
+
 def add_openvino_dll_dir():
     """Windows：onnxruntime-openvino 的 provider DLL 依賴 openvino 套件的 DLL（openvino\\libs），不在預設搜尋路徑。
 
@@ -273,38 +289,79 @@ def add_openvino_dll_dir():
             return
 
 
-class GPU:
-    """OpenVINO Intel GPU session（FP32）。
+def open_gpu(ort, path):
+    """依 GPU_PROVIDERS 的順序開第一個可用的 GPU session，回傳 (session, 名稱)；都不行時丟例外。
 
-    GPU 收動態形狀，不必補齊：新形狀第一次約數十 ms（量測最多 46 ms），之後約 7 ms。FP16 不能用：
-    遮罩以 float32 最小值相加，fp16 溢位成 inf／NaN。執行出錯或分數非有限值時這一次改用 CPU，
-    連續出錯 GPU_MAX_ERRORS 次即停用。
+    一台電腦只裝得了一種 onnxruntime（cuda、rocm、directml、openvino 版互相取代），可用的 provider 由它決定。
+    provider 建不起來時 onnxruntime 只印警告並改用 CPU，所以以 get_providers() 確認真的是那個 provider。
     """
-    GPU_MAX_ERRORS = 3
-
-    def __init__(self, ort, path):
+    available = set(ort.get_available_providers())
+    errors = []
+    for name, provider, provider_options in GPU_PROVIDERS:
+        if provider not in available:
+            continue
+        if provider == 'OpenVINOExecutionProvider':
+            add_openvino_dll_dir()
         options = ort.SessionOptions()
         options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
-        session = ort.InferenceSession(path, sess_options=options,
-                                       providers=[('OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'})])
-        if session.get_providers()[0] != 'OpenVINOExecutionProvider':
-            raise RuntimeError('openvino_gpu_unavailable')
-        self.session, self.errors = session, 0
+        if provider == 'DmlExecutionProvider':   # DirectML 不支援記憶體模式與平行執行
+            options.enable_mem_pattern = False
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        try:
+            session = ort.InferenceSession(path, sess_options=options, providers=[(provider, provider_options)])
+        except Exception as e:   # noqa: BLE001 — 試下一個
+            errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
+            continue
+        if session.get_providers()[0] == provider:
+            return session, name
+        errors.append(f'{name}: fell back to {session.get_providers()[0]}')
+    raise RuntimeError('no_gpu_provider' + (' (' + '; '.join(errors) + ')' if errors else ''))
+
+
+class Offload:
+    """在常駐的背景執行緒跑 GPU session；前景最多等 budget 秒，沒等到就這一次改用 CPU（回 None）。
+
+    沒等到的那次照樣在背景跑完，等於替這個形狀暖機（有些 provider 每個新形狀第一次要編譯，久的要數秒）；
+    跑完之前 session 占著，其他請求也走 CPU，請求永遠不等 GPU 超過 budget，宿主的期限也就不會因 GPU 逾時。
+    session 只在同一個常駐執行緒上跑（OpenVINO 等 provider 依執行緒保留推論狀態，每次換執行緒會變慢）。
+    執行出錯或輸出非有限值時這一次改用 CPU，連續 GPU_MAX_ERRORS 次即停用。
+    """
+
+    def __init__(self, session, name, output, budget):
+        self.session, self.name, self.output, self.budget = session, name, output, budget
+        self.idle, self.errors = True, 0
+        self.jobs = queue.Queue(maxsize=1)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            inputs, box, done = self.jobs.get()
+            try:
+                box['out'] = self.session.run([self.output], inputs)[0]
+            except Exception as e:   # noqa: BLE001
+                box['error'] = e
+            finally:
+                self.idle = True
+                done.set()
 
     def run(self, inputs):
-        if self.errors >= self.GPU_MAX_ERRORS:
+        if self.errors >= GPU_MAX_ERRORS or not self.idle:
             return None
-        try:
-            raw = self.session.run(['scores'], inputs)[0]
-            if not np.isfinite(raw).all():
-                raise ValueError('nonfinite_neural_score')
-        except Exception as e:   # noqa: BLE001 — 這一次改用 CPU
+        box, done = {}, threading.Event()
+        self.idle = False   # 只有前景（主執行緒）設成 False、只有背景設回 True
+        self.jobs.put((inputs, box, done))
+        if not done.wait(self.budget):
+            return None
+        out = box.get('out')
+        if out is None or not np.isfinite(out).all():
             self.errors += 1
-            if self.errors == self.GPU_MAX_ERRORS:
-                print(f'gpu disabled, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
+            if self.errors == GPU_MAX_ERRORS:
+                reason = str(box.get('error', 'nonfinite output')).splitlines()[0][:200]
+                print(f'gpu ({self.name}) disabled, using cpu: {reason}', file=sys.stderr, flush=True)
             return None
         self.errors = 0
-        return raw
+        return out
+# <<< accel-shared
 
 
 class Runtime:
@@ -337,11 +394,14 @@ class Runtime:
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.add_session_config_entry('session.intra_op.allow_spinning', '0')
         self.session = ort.InferenceSession(str(package / 'model.onnx'), sess_options=options, providers=['CPUExecutionProvider'])
-        self.accel = None   # 加速裝置（NPU 或 GPU）；None 時只用 CPU
+        self.accel = None   # 加速裝置（NPU 或 Offload 包著的 GPU）；None 時只用 CPU
         if accel != 'cpu':
             try:
-                add_openvino_dll_dir()
-                self.accel =(NPU if accel == 'npu' else GPU)(ort, str(package / 'model.onnx'))
+                if accel == 'npu':
+                    add_openvino_dll_dir()
+                    self.accel = NPU(ort, str(package / 'model.onnx'))
+                else:
+                    self.accel = Offload(*open_gpu(ort, str(package / 'model.onnx')), 'scores', GPU_BUDGET)
             except Exception as e:   # noqa: BLE001 — 裝置無法使用時照舊只用 CPU
                 print(f'{accel} unavailable, using cpu: {e}', file=sys.stderr, flush=True)
         self.model_sha = m['files']['model.onnx']; self.dictionary = dictionary
@@ -387,7 +447,8 @@ def main():
     p.add_argument('--package', type=Path, required=True); p.add_argument('--dictionary', required=True)
     p.add_argument('--threads', type=int, default=2)
     p.add_argument('--accel', choices=ACCELS, default='cpu',
-                   help='npu：已編譯形狀走 OpenVINO NPU；gpu：OpenVINO Intel GPU（FP32）；裝置無法使用時走 CPU')
+                   help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、DirectML、OpenVINO，FP32）；'
+                        'npu：已編譯形狀走 OpenVINO Intel NPU；裝置無法使用時走 CPU')
     a = p.parse_args()
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')
@@ -408,8 +469,11 @@ def main():
              'dictionary_sha256': a.dictionary, 'allow_partial': runtime.allow_partial}
     if runtime.allow_unknown_tones:
         ready['tone_policy'] = runtime.manifest['tone_policy']
-    # 實際使用的裝置：要求 gpu／npu 但裝置無法使用時是 cpu（宿主的 health 回報 selection_accel）。
-    ready['accel'] = 'npu' if isinstance(runtime.accel, NPU) else 'gpu' if isinstance(runtime.accel, GPU) else 'cpu'
+    # 實際使用的裝置與 provider：要求 gpu／npu 但裝置無法使用時是 cpu（宿主的 health 回報 selection_accel、
+    # selection_accel_provider）。
+    ready['accel'] = 'npu' if isinstance(runtime.accel, NPU) else 'gpu' if isinstance(runtime.accel, Offload) else 'cpu'
+    if runtime.accel is not None:
+        ready['accel_provider'] = 'openvino' if isinstance(runtime.accel, NPU) else runtime.accel.name
     print(json.dumps(ready), flush=True)
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 1)

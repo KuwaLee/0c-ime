@@ -204,6 +204,16 @@ func (s *Supervisor) Accel() string {
 	return s.current.Accel()
 }
 
+// Provider 回報目前 worker 加速時用的 provider；沒有可用的 worker、CPU 或舊 worker 時為空字串。
+func (s *Supervisor) Provider() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil || s.current.Dead() {
+		return ""
+	}
+	return s.current.Provider()
+}
+
 // Reason 回傳最近一次啟動失敗的原因代碼（StartupError.Reason）；沒有失敗或已恢復時為空字串。
 func (s *Supervisor) Reason() string { s.mu.Lock(); defer s.mu.Unlock(); return s.reason }
 

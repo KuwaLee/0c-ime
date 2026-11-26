@@ -94,10 +94,12 @@
   // 模型實際使用的硬體加速（health 的 selection_accel、punctuation_accel）。要求了加速卻是 CPU：推論元件或驅動不支援，
   // worker 已改回 CPU。設定剛改、引擎還沒重新啟動（pending）時不下結論。補標點只支援 GPU（模型不能補齊成 NPU 的
   // 固定形狀），選 NPU 時補標點照常用 CPU，不算無法使用。
-  const ACCEL_LABEL = { gpu: '（Intel 內顯加速）', npu: '（Intel NPU 加速）' };
-  function accelNote(modelState, accel, supported) {
+  // provider 代碼的顯示名稱（與 0c-update 的 providerNames 相同）。
+  const ACCEL_PROVIDER = { cuda: 'NVIDIA CUDA', migraphx: 'AMD MIGraphX', rocm: 'AMD ROCm', directml: 'DirectML', openvino: 'Intel OpenVINO' };
+  function accelNote(modelState, accel, provider, supported) {
     if (modelState !== 'ready') return '';
-    if (ACCEL_LABEL[accel]) return ACCEL_LABEL[accel];
+    if (accel === 'gpu') return ACCEL_PROVIDER[provider] ? '（GPU 加速，' + ACCEL_PROVIDER[provider] + '）' : '（GPU 加速）';
+    if (accel === 'npu') return '（NPU 加速，Intel OpenVINO）';
     const wanted = (state.settings?.items || []).find((item) => item.key === 'neural-accel');
     if (wanted && !wanted.pending && supported.includes(wanted.value) && accel === 'cpu') {
       return '（硬體加速無法使用，以 CPU 計算）';
@@ -414,9 +416,9 @@
     ];
     if (runtime.state === 'running') {
       rows.push(
-        row(labelBlock('神經選字'), h('div', { class: 'value' }, modelLabel(runtime.selection_state, '統計引擎') + (MODEL_REASON[runtime.selection_reason] || '') + accelNote(runtime.selection_state, runtime.selection_accel, ['gpu', 'npu']), ' ',
+        row(labelBlock('神經選字'), h('div', { class: 'value' }, modelLabel(runtime.selection_state, '統計引擎') + (MODEL_REASON[runtime.selection_reason] || '') + accelNote(runtime.selection_state, runtime.selection_accel, runtime.selection_accel_provider, ['gpu', 'npu']), ' ',
           h('button', { type: 'button', class: 'secondary', 'data-focus': 'models-card', onclick: () => show('models') }, '查看'))),
-        row(labelBlock('補標點（Beta）'), h('div', { class: 'value' }, modelLabel(runtime.punctuation_state, '原文提交') + (MODEL_REASON[runtime.punctuation_reason] || '') + accelNote(runtime.punctuation_state, runtime.punctuation_accel, ['gpu']))));
+        row(labelBlock('補標點（Beta）'), h('div', { class: 'value' }, modelLabel(runtime.punctuation_state, '原文提交') + (MODEL_REASON[runtime.punctuation_reason] || '') + accelNote(runtime.punctuation_state, runtime.punctuation_accel, runtime.punctuation_accel_provider, ['gpu']))));
     }
     const managed = packageManaged();
     const summary = managed ? { text: PACKAGE_MANAGED, tone: 'muted' } : updateSummary(status.update);

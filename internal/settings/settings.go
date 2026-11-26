@@ -124,9 +124,9 @@ type Settings struct {
 	// Toneless：不打聲調也能選字（#150，聲調選填）。預設 false。開啟時沒打聲調的音節由解碼決定、有打的照聲調；
 	// 中英混打的自動判斷停用（與混打二選一），已儲存的 mixed_input 不動，關掉這一項就照舊。
 	Toneless bool `json:"toneless"`
-	// NeuralAccel：神經選字與補標點的硬體加速（AccelCPU、AccelGPU、AccelNPU）。預設 cpu（缺欄位時也是）。gpu、npu 經
-	// onnxruntime 的 OpenVINO EP 用 Intel 內顯或 NPU；推論環境沒有 OpenVINO 或裝置無法使用時 worker 照舊用 CPU，
-	// health 的 selection_accel 回報實際使用的裝置。只有 Windows、Linux（NeuralAccelSetting）；macOS 沒有這一項。
+	// NeuralAccel：神經選字與補標點的硬體加速（AccelCPU、AccelGPU、AccelNPU）。預設 cpu（缺欄位時也是）。gpu 用
+	// onnxruntime 裡第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、DirectML、OpenVINO），npu 用 OpenVINO 的 Intel NPU；
+	// 推論環境或裝置不支援時 worker 照舊用 CPU，health 的 *_accel、*_accel_provider 回報實際使用的裝置。只有 Windows、Linux（NeuralAccelSetting）；macOS 沒有這一項。
 	// 只用統計引擎時不作用。
 	NeuralAccel string `json:"neural_accel"`
 	Fuzzy       Fuzzy  `json:"fuzzy,omitzero"`
@@ -785,7 +785,7 @@ func (s Settings) valueLabels(key string) map[string]string {
 	case "keyboard-layout":
 		return map[string]string{LayoutStandard: "標準", LayoutETen: "倚天 41 鍵", LayoutHsu: "許氏", LayoutPinyin: "漢語拼音"}
 	case "neural-accel":
-		return map[string]string{AccelCPU: "不使用（CPU）", AccelGPU: "Intel 內顯（GPU）", AccelNPU: "Intel NPU"}
+		return map[string]string{AccelCPU: "不使用（CPU）", AccelGPU: "顯示卡（GPU）", AccelNPU: "Intel NPU"}
 	case "shift-tap-ms": // #319
 		out := map[string]string{}
 		for _, ms := range ShiftTapChoices {
@@ -1063,9 +1063,10 @@ func (s Settings) EffectiveNeuralAccel() string {
 }
 
 // neuralAccelDescription 是「硬體加速」的說明。
-const neuralAccelDescription = "神經選字與補標點改用 Intel 內顯或 NPU 計算，打字時的延遲較低、少占 CPU。需要 Intel 的顯示或 NPU 驅動，" +
-	"以及支援 OpenVINO 的推論元件；無法使用時自動改回 CPU，設定頁會顯示實際使用的裝置。內顯的結果與 CPU 相同；NPU 較省電，" +
-	"但只用在神經選字，部分較長的組字仍由 CPU 計算，結果與 CPU 略有差異；補標點照常用 CPU"
+const neuralAccelDescription = "神經選字與補標點改用顯示卡（NVIDIA、AMD、Intel）或 Intel NPU 計算，打字時的延遲較低、少占 CPU。" +
+	"需要顯示卡或 NPU 的驅動，以及對應的推論元件（NVIDIA 用 CUDA、AMD 用 ROCm、Windows 也可用 DirectML、Intel 用 OpenVINO）；" +
+	"無法使用時自動改回 CPU，設定頁會顯示實際使用的裝置。顯示卡的結果與 CPU 相同；NPU 較省電，但只用在神經選字，" +
+	"部分較長的組字仍由 CPU 計算，結果與 CPU 略有差異；補標點照常用 CPU"
 
 // SimplifiedHotkeyLabel 是切換「輸出簡體字」的快捷鍵（#192），設定說明與 0c-update 的文字用它；四個外殼各自比對同一組鍵。
 // 負責人在 Ctrl＋Shift＋F1～F12 裡選定 F11（#192）：兩個相鄰修飾鍵；撞到的只有冷門功能（Word 解除功能變數鎖定、

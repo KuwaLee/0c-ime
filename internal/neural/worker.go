@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -226,6 +227,7 @@ type Worker struct {
 	next     uint64
 	stats    Stats
 	accel    string // worker 就緒時回報實際使用的裝置（AccelCPU／AccelGPU／AccelNPU）
+	provider string // 加速時用的 provider（cuda、migraphx、rocm、directml、openvino）；CPU 時為空
 }
 
 func fileSHA(path string) (string, error) {
@@ -374,6 +376,7 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 		Model        string `json:"model_sha256"`
 		Dictionary   string `json:"dictionary_sha256"`
 		Accel        string `json:"accel"`
+		Provider     string `json:"accel_provider"`
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &ready)
@@ -385,7 +388,19 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 	}
 	stderr.finish()
 	w.accel = readyAccel(ready.Accel)
+	w.provider = readyProvider(w.accel, ready.Provider)
 	return w, nil
+}
+
+// Providers 是 worker 會回報的加速 provider（sequence_runtime.py、punct_runtime.py 的 GPU_PROVIDERS 與 NPU 的 openvino）。
+var Providers = []string{"cuda", "migraphx", "rocm", "directml", "openvino"}
+
+// readyProvider：CPU 時沒有 provider；不認得的值不轉交（health 只放已知的代碼）。
+func readyProvider(accel, v string) string {
+	if accel == AccelCPU || !slices.Contains(Providers, v) {
+		return ""
+	}
+	return v
 }
 
 // readyAccel 把就緒訊息的 accel 正規化：舊 worker 沒有這個欄位、或不認得的值，都當作 CPU。
@@ -398,6 +413,9 @@ func readyAccel(v string) string {
 
 // Accel 回報 worker 實際使用的推論裝置（就緒時回報；之後 GPU／NPU 出錯改用 CPU 時不更新）。
 func (w *Worker) Accel() string { return w.accel }
+
+// Provider 回報加速時用的 provider；CPU 或舊 worker 沒有回報時為空字串。
+func (w *Worker) Provider() string { return w.provider }
 
 // exchange 至多有一個 I/O goroutine。逾時關閉管線並殺掉 worker，不排隊、不可晚套用。
 func (w *Worker) exchange(request []byte, timeout time.Duration) ([]byte, error) {
