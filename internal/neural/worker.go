@@ -227,7 +227,7 @@ type Worker struct {
 	next     uint64
 	stats    Stats
 	accel    string // worker 就緒時回報實際使用的裝置（AccelCPU／AccelGPU／AccelNPU）
-	provider string // 加速時用的 provider（cuda、migraphx、rocm、openvino、vitisai）；CPU 時為空
+	provider string // 加速時用的 provider（cuda、migraphx、openvino、vitisai）；CPU 時為空
 }
 
 func fileSHA(path string) (string, error) {
@@ -394,7 +394,7 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 
 // Providers 是 worker 會回報的加速 provider：GPU_PROVIDERS（兩個 worker 的 accel-shared 區塊）依序，再加上只用在
 // NPU 的 vitisai（sequence_runtime.py 的 NPU_PROVIDERS；openvino 兩邊都有）。
-var Providers = []string{"cuda", "migraphx", "rocm", "openvino", "vitisai"}
+var Providers = []string{"cuda", "migraphx", "openvino", "vitisai"}
 
 // readyProvider：CPU 時沒有 provider；不認得的值不轉交（health 只放已知的代碼）。
 func readyProvider(accel, v string) string {

@@ -95,7 +95,7 @@
   // worker 已改回 CPU。設定剛改、引擎還沒重新啟動（pending）時不下結論。補標點只支援 GPU（模型不能補齊成 NPU 的
   // 固定形狀），選 NPU 時補標點照常用 CPU，不算無法使用。
   // provider 代碼的顯示名稱（與 0c-update 的 providerNames 相同）。
-  const ACCEL_PROVIDER = { cuda: 'NVIDIA CUDA', migraphx: 'AMD MIGraphX', rocm: 'AMD ROCm',openvino: 'Intel OpenVINO', vitisai: 'AMD Ryzen AI' };
+  const ACCEL_PROVIDER = { cuda: 'NVIDIA CUDA', migraphx: 'AMD MIGraphX', openvino: 'Intel OpenVINO', vitisai: 'AMD Ryzen AI' };
   function accelNote(modelState, accel, provider, supported) {
     if (modelState !== 'ready') return '';
     if (accel === 'gpu') return ACCEL_PROVIDER[provider] ? '（GPU 加速，' + ACCEL_PROVIDER[provider] + '）' : '（GPU 加速）';
@@ -517,7 +517,7 @@
     const v = (vendors || '').split(',');
     if (kind === 'npu') return v.includes('amd') ? '需要 AMD Ryzen AI Software' : v.includes('intel') ? '需要 OpenVINO 版的推論元件與 NPU 驅動' : '這種 NPU 不支援';
     if (v.includes('nvidia')) return '需要 CUDA 版的推論元件';
-    if (v.includes('amd')) return '需要 ROCm 版的推論元件';
+    if (v.includes('amd')) return '需要 MIGraphX 版的推論元件';
     if (v.includes('intel')) return '需要 OpenVINO 版的推論元件';
     return '需要支援這張顯示卡的推論元件';
   }

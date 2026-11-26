@@ -125,7 +125,7 @@ type Settings struct {
 	// 中英混打的自動判斷停用（與混打二選一），已儲存的 mixed_input 不動，關掉這一項就照舊。
 	Toneless bool `json:"toneless"`
 	// NeuralAccel：神經選字與補標點的硬體加速（AccelCPU、AccelGPU、AccelNPU）。預設 cpu（缺欄位時也是）。gpu 用
-	// onnxruntime 裡第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、OpenVINO），npu 用 OpenVINO（Intel）或 VitisAI（AMD，實驗性）；
+	// onnxruntime 裡第一個可用的 GPU provider（CUDA、MIGraphX、OpenVINO），npu 用 OpenVINO（Intel）或 VitisAI（AMD，實驗性）；
 	// 推論環境或裝置不支援時 worker 照舊用 CPU，health 的 *_accel、*_accel_provider 回報實際使用的裝置。只有 Windows、Linux（NeuralAccelSetting）；macOS 沒有這一項。
 	// 只用統計引擎時不作用。
 	NeuralAccel string `json:"neural_accel"`

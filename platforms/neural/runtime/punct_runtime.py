@@ -68,11 +68,42 @@ GPU_PROVIDERS = (
     # 依序試，第一個建得起來的就用。一律 FP32：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN。
     # 不用 TensorRT：每個新形狀都要建引擎（數秒以上），遠超過宿主的期限。
     ('cuda', 'CUDAExecutionProvider', {'use_tf32': '0'}),   # NVIDIA；TF32 只有 10 位尾數，關掉以保持 FP32 結果
-    ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm）
-    ('rocm', 'ROCMExecutionProvider', {}),                  # AMD（舊版 onnxruntime-rocm）
+    ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm 上的 MIGraphX；ROCm EP 已被官方標為 deprecated，不用）
     ('openvino', 'OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'}),   # Intel
 )
 GPU_MAX_ERRORS = 3
+_openvino_plugin = None
+
+
+def openvino_plugin(ort):
+    """onnxruntime-ep-openvino（OpenVINO 的 plugin EP）的裝置：{'GPU': OrtEpDevice, 'NPU': …}；沒裝或載入失敗時是 {}。
+
+    plugin 掛在一般的 onnxruntime（1.23 以上）上、wheel 不分 Python 版本、自帶 OpenVINO，所以內附的 Python 與
+    onnxruntime 不必換；舊的 onnxruntime-openvino 要取代整個 onnxruntime，且只到 cp313、要配對 openvino 套件的版本。
+    兩者都裝時用舊的（provider 已在 get_available_providers 裡）。plugin 一個行程只註冊一次。
+    """
+    global _openvino_plugin
+    if _openvino_plugin is None:
+        _openvino_plugin = {}
+        try:
+            import onnxruntime_ep_openvino as plugin
+            ort.register_execution_provider_library('zc_openvino', plugin.get_library_path())
+            name = plugin.get_ep_name()
+            for device in ort.get_ep_devices():
+                kind = str(device.ep_metadata.get('ov_device', '')).split('.')[0]   # GPU、GPU.0、NPU…
+                if device.ep_name == name and kind in ('GPU', 'NPU'):
+                    _openvino_plugin.setdefault(kind, device)
+        except Exception:   # noqa: BLE001 — 沒裝 plugin、onnxruntime 太舊（沒有 plugin API）時就是沒有
+            _openvino_plugin = {}
+    return _openvino_plugin
+
+
+def openvino_plugin_options(options, device, config):
+    """把 plugin 裝置加進 SessionOptions；config 是 OpenVINO 的屬性（plugin 忽略 precision、cache_dir 等 provider 選項，
+    要以 load_config 給）。OpenVINO 編譯失敗時會靜默改用自己的 CPU，所以一律關掉 CPU 退路。"""
+    options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+    name = str(device.ep_metadata.get('ov_device', ''))
+    options.add_provider_for_devices([device], {'load_config': json.dumps({name: config})})
 
 
 def add_openvino_dll_dir():
@@ -96,22 +127,29 @@ def add_openvino_dll_dir():
 def open_gpu(ort, path):
     """依 GPU_PROVIDERS 的順序開第一個可用的 GPU session，回傳 (session, 名稱)；都不行時丟例外。
 
-    一台電腦只裝得了一種 onnxruntime（cuda、rocm、openvino 版互相取代），可用的 provider 由它決定。
+    一台電腦只裝得了一種 onnxruntime（cuda、migraphx、openvino 版互相取代），可用的 provider 由它決定；Intel 也可以是
+    一般 onnxruntime 加上 OpenVINO 的 plugin（openvino_plugin）。
     provider 建不起來時 onnxruntime 只印警告並改用 CPU，所以以 get_providers() 確認真的是那個 provider。
     """
     available = set(ort.get_available_providers())
     errors = []
     for name, provider, provider_options in GPU_PROVIDERS:
-        if provider not in available:
-            continue
         options = ort.SessionOptions()
-        if provider == 'OpenVINOExecutionProvider':
+        providers = [(provider, provider_options)]
+        if provider not in available:
+            device = openvino_plugin(ort).get('GPU') if provider == 'OpenVINOExecutionProvider' else None
+            if device is None:
+                continue
+            # OpenVINO 的 GPU 預設以 f16 計算，要明確指定 f32。
+            openvino_plugin_options(options, device, {'INFERENCE_PRECISION_HINT': 'f32'})
+            providers = None
+        elif provider == 'OpenVINOExecutionProvider':
             add_openvino_dll_dir()
             # OpenVINO 編譯失敗時會靜默改用自己的 CPU（比較慢），要它丟錯。其他 provider 本來就會把少數
             # 形狀運算分給 CPU EP，設了反而整個 session 開不起來，所以只對 OpenVINO 設。
             options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
         try:
-            session = ort.InferenceSession(path, sess_options=options, providers=[(provider, provider_options)])
+            session = ort.InferenceSession(path, sess_options=options, providers=providers)
         except Exception as e:   # noqa: BLE001 — 試下一個
             errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
             continue
@@ -251,7 +289,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--package', type=Path, required=True)
     p.add_argument('--threads', type=int, default=2)
-    p.add_argument('--accel', choices=('cpu', 'gpu'), default='cpu', help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、OpenVINO，FP32）；無法使用時走 CPU')
+    p.add_argument('--accel', choices=('cpu', 'gpu'), default='cpu', help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、OpenVINO，FP32）；無法使用時走 CPU')
     a = p.parse_args()
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')

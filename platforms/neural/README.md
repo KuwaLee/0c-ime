@@ -28,21 +28,21 @@ build/0c-server -data assets/data \
 | provider | 顯示卡 | 需要的 onnxruntime |
 |---|---|---|
 | `cuda`（CUDA EP，關掉 TF32） | NVIDIA | Arch `python-onnxruntime-cuda`；pip `onnxruntime-gpu` |
-| `migraphx`、`rocm` | AMD（ROCm 支援的型號） | Arch `python-onnxruntime-rocm`；pip `onnxruntime-rocm` |
+| `migraphx` | AMD（ROCm 支援的型號） | 含 MIGraphX EP 的 onnxruntime：pip `onnxruntime-migraphx`；Arch 的 `python-onnxruntime-rocm` 有沒有帶 MIGraphX 以 `--probe` 確認 |
 | `openvino`（`device_type` GPU） | Intel | Arch 自行打包的 `python-onnxruntime-openvino` 加 `openvino-intel-gpu-plugin`、`intel-compute-runtime`；pip `onnxruntime-openvino`（Windows 另要 `openvino`） |
 
-一台電腦只裝得了一種 onnxruntime（這些套件互相取代），可用的 provider 由它決定。一律以 FP32 計算、收動態形狀：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN；不用 TensorRT，因為每個新形狀都要建引擎（數秒以上）。GPU 在常駐的背景執行緒上跑（`Offload`），每個請求最多等 30 ms（補標點每一窗 50 ms），沒等到就這一次用 CPU、GPU 在背景跑完當作暖機，所以新形狀編譯很久的 provider 也不會讓引擎逾時。
+一台電腦只裝得了一種 onnxruntime（這些套件互相取代），可用的 provider 由它決定。Intel 也可以不換 onnxruntime：一般的 onnxruntime（1.23 以上）加裝 OpenVINO 的 plugin EP `onnxruntime-ep-openvino`（wheel 不分 Python 版本、自帶 OpenVINO，所以官網安裝包內附的 Python 3.14 也能用），worker 以 `openvino_plugin()` 註冊、從 `get_ep_devices()` 取裝置。plugin 只用在 GPU：它忽略 `precision` 等 provider 選項，以 `load_config` 指定 `INFERENCE_PRECISION_HINT` f32；NPU 不用 plugin（1.8.1 實測：建 session 時就要整個編譯、NPU 只收固定形狀，onnxruntime 1.30 建 session 時不放開 GIL，前景停住數秒；編譯快取讀回時因 bool 的 mask 報 Type mismatch）。兩者都裝時用舊的 `onnxruntime-openvino`。一律以 FP32 計算、收動態形狀：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN；不用 TensorRT，因為每個新形狀都要建引擎（數秒以上）。GPU 在常駐的背景執行緒上跑（`Offload`），每個請求最多等 30 ms（補標點每一窗 50 ms），沒等到就這一次用 CPU、GPU 在背景跑完當作暖機，所以新形狀編譯很久的 provider 也不會讓引擎逾時。
 
 **補標點**只支援 GPU：模型沒有遮罩輸入，補齊會改變結果，不能用 NPU 要的固定形狀，所以選 NPU 時補標點照常用 CPU。
 
 **NPU** 依序試 `NPU_PROVIDERS`：
 
-- `openvino`（Intel NPU，Core Ultra）：需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。一個 session 收動態形狀，每個新形狀第一次執行時編譯，編譯結果快取在 `~/.cache/ze_intel_npu_cache`（驅動的快取），另外 OpenVINO 自己的快取放在 `~/.cache/0c/openvino`（Windows 是 `%LOCALAPPDATA%\Zuin\cache\openvino`，6 個形狀約 580 MB）。Windows 的 NPU 驅動沒有磁碟快取，沒有 OpenVINO 快取時每次啟動要重編約 20 s（每個形狀約 3.4 s），編譯完成前的請求都走 CPU；有快取後約 5 s。Windows 上 NPU 在上一個用它的程序剛結束時約有 0.5 s 開不起來（引擎交接重啟正好碰上），worker 會稍等重試。
+- `openvino`（Intel NPU，Core Ultra）：需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。一個 session 收動態形狀，每個新形狀第一次執行時編譯，編譯結果快取在 `~/.cache/ze_intel_npu_cache`（驅動的快取），另外 OpenVINO 自己的快取放在 `~/.cache/0c/openvino`（Windows 是 `%LOCALAPPDATA%\Zuin\cache\openvino`，6 個形狀約 580 MB）。Windows 的 NPU 驅動沒有磁碟快取，沒有 OpenVINO 快取時每次啟動要重編約 20 s（每個形狀約 3.4 s），編譯完成前的請求都走 CPU；有快取後約 5 s。Windows 上 NPU 在上一個用 OpenVINO 的程序剛結束時有 0.5–1.5 s 開不起來（引擎交接重啟正好碰上），worker 會稍等重試（最多約 3.5 s）。
 - `vitisai`（AMD Ryzen AI NPU，**實驗性，沒有在 AMD 硬體上驗證過**）：需要 AMD 的 Ryzen AI Software（VitisAI EP 不在一般的 onnxruntime 套件裡），以它的 Python 環境當 worker 的 Python。Ryzen AI 1.6 起接受原本的 FP32 模型、編譯時轉成 BF16（不必量化，模型檔不變），但部署版的 EP 不能現場編譯 BF16，要完整的 Ryzen AI Software；編譯設定檔取 `ZC_VITISAI_CONFIG`，或 `RYZEN_AI_INSTALLATION_PATH` 底下的 `vaip_config.json`。NPU 編譯器要固定形狀，所以每個形狀各開一個 session（以 free dimension override 固定 `L`、`u`、`k`、`n`），編譯結果放在 `%LOCALAPPDATA%\Zuin\cache\vitisai`（Linux 是 `~/.cache/0c/vitisai`）。不關 CPU 退路：VitisAI 本來就把 NPU 不支援的運算交給 CPU。
 
 NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24：每個位置要對約 2.8 萬字的字表做 log_softmax，放不進 Intel NPU 的片上記憶體；AMD 沿用同樣的形狀）、或 NPU 無法使用時，照舊用 CPU，請求不等編譯。Intel 以 fp16、AMD 以 BF16 計算，分數與 CPU 略有差異（BF16 的範圍與 FP32 相同，不會像 fp16 一樣溢位，但精度較低，要以 `accel_check.py` 量）。
 
-**偵測**：引擎啟動後在背景以選字 worker 的 Python 跑一次 `sequence_runtime.py --probe`（不載入模型，約 0.2 秒），回報這台的裝置與 onnxruntime 的 provider，放進 health 的 `accel_probe`、`accel_gpu`／`accel_npu`（`available`、`no_device`、`no_runtime`）、`accel_*_devices`、`accel_*_vendors`、`accel_*_providers`（`neural.Probe`）。裝置來自 Linux 的 `/sys/bus/pci/devices`（PCI class 0x03 的顯示控制器）與 `/sys/class/accel`（驅動是 `intel_vpu` 或 `amdxdna` 的 NPU），Windows 的登錄裝置類別 `Display` 與 `ComputeAccelerator`（「神經處理器」；Windows 這一段沒有實機驗證過）。provider 依廠牌配對：`cuda`→NVIDIA、`migraphx`／`rocm`／`vitisai`→AMD、`openvino`→Intel。設定程式據此在「硬體加速」的選項旁標出偵測到的裝置，沒有裝置或推論元件不支援的選項不能選（目前選著的除外），`0c-update status` 也列出偵測結果。偵測只代表「應該能用」，驅動或 plugin 有問題時仍可能開不起來，實際使用的裝置看 `*_accel`。
+**偵測**：引擎啟動後在背景以選字 worker 的 Python 跑一次 `sequence_runtime.py --probe`（不載入模型，約 0.2 秒），回報這台的裝置與 onnxruntime 的 provider，放進 health 的 `accel_probe`、`accel_gpu`／`accel_npu`（`available`、`no_device`、`no_runtime`）、`accel_*_devices`、`accel_*_vendors`、`accel_*_providers`（`neural.Probe`）。裝置來自 Linux 的 `/sys/bus/pci/devices`（PCI class 0x03 的顯示控制器）與 `/sys/class/accel`（驅動是 `intel_vpu` 或 `amdxdna` 的 NPU），Windows 的登錄裝置類別 `Display` 與 `ComputeAccelerator`（「神經處理器」；Windows 這一段沒有實機驗證過）。provider 依廠牌配對：`cuda`→NVIDIA、`migraphx`／`vitisai`→AMD、`openvino`→Intel。設定程式據此在「硬體加速」的選項旁標出偵測到的裝置，沒有裝置或推論元件不支援的選項不能選（目前選著的除外），`0c-update status` 也列出偵測結果。偵測只代表「應該能用」，驅動或 plugin 有問題時仍可能開不起來，實際使用的裝置看 `*_accel`。
 
 在 Core Ultra 200V（Arc 140V，`openvino`）量測，往返延遲：
 
@@ -66,19 +66,22 @@ NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的
 |---|---|---|---|
 | `gpu` | Intel 內顯 | `python-onnxruntime-openvino`（官方軟體庫沒有，要自行打包：onnxruntime 以 `--use_openvino` 建置）、`openvino-intel-gpu-plugin`、`intel-compute-runtime` | — |
 | `gpu` | NVIDIA | `python-onnxruntime-cuda`（依賴帶進 `cuda`、`cudnn`）、`nvidia` 或 `nvidia-open` 驅動 | — |
-| `gpu` | AMD | `python-onnxruntime-rocm`（依賴帶進 ROCm 執行階段）；顯示卡要在 ROCm 支援清單內 | 使用者在 `render`、`video` 群組 |
+| `gpu` | AMD | 含 MIGraphX EP 的 `python-onnxruntime-rocm`（依賴帶進 ROCm 執行階段；有沒有 MIGraphX 以 `--probe` 確認）；顯示卡要在 ROCm 支援清單內 | 使用者在 `render`、`video` 群組 |
 | `npu` | Intel NPU（Core Ultra） | `python-onnxruntime-openvino`、`openvino-intel-npu-plugin`、`intel-npu-driver`、`level-zero-loader` | 使用者打得開 `/dev/accel/accel*`（見下） |
 | `npu` | AMD NPU（Ryzen AI，實驗性） | 核心的 `amdxdna` 驅動與 AMD 的 Ryzen AI Software（XRT、VitisAI EP；Arch 沒有套件） | 以 Ryzen AI Software 的 Python 當 worker 的 Python |
 
+Intel 內顯也可以不換 `python-onnxruntime`（1.23 以上）改裝 plugin `onnxruntime-ep-openvino`（只用在 GPU）。worker 以 `-I` 執行，不讀 `PYTHONPATH` 與使用者的 site-packages，plugin 要在系統的 site-packages 裡（例如自行打包成 `python-onnxruntime-ep-openvino`）；由設定程式下載後端的功能做好之前，沒有其他放法。
+
 `intel-npu-driver` 的 udev 規則（`10-intel-npu.rules`）把 `/dev/accel/accel*` 設成 `root:render 0660`，systemd 預設的 `50-udev-default.rules` 再設回 `0666`；剛裝好驅動時可能停在 0660，`sudo udevadm trigger --subsystem-match=accel --action=add` 或重新開機後恢復，或把使用者加進 `render` 群組（重新登入生效）。
 
-**Linux（Debian、Ubuntu 等）**：發行版沒有 GPU 版的 `python3-onnxruntime`。在 venv 以 pip 裝下表 Windows 那一欄的套件（NVIDIA 用 `onnxruntime-gpu`、AMD 用 `onnxruntime-rocm`、Intel 用 `onnxruntime-openvino`），驅動與執行階段照各廠商的說明裝，再以 `0c-server -neural-python <venv>/bin/python3` 指向它。
+**Linux（Debian、Ubuntu 等）**：發行版沒有 GPU 版的 `python3-onnxruntime`。在 venv 以 pip 裝下表 Windows 那一欄的套件（NVIDIA 用 `onnxruntime-gpu`、AMD 用 `onnxruntime-migraphx`、Intel 用 `onnxruntime-openvino`），驅動與執行階段照各廠商的說明裝，再以 `0c-server -neural-python <venv>/bin/python3` 指向它。
 
 **Windows**：官網安裝包內附的 Python 3.14 與 onnxruntime 只有 CPU，要另外準備一個 Python（`onnxruntime-openvino` 只有到 Python 3.13 的 wheel，建議 3.13），裝下表的套件，再讓 `0c-server` 以 `-neural-python` 指向它（安裝包本身還沒內附加速元件）。
 
 | 選項 | 裝置 | pip 套件 | 驅動與執行階段 |
 |---|---|---|---|
 | `gpu` | NVIDIA（CUDA） | `numpy onnxruntime-gpu` | NVIDIA 驅動，以及 onnxruntime 版本要求的 CUDA 12 與 cuDNN 9 |
+| `gpu` | Intel 內顯（不換 onnxruntime） | 內附 Python 的 `Lib\site-packages` 加裝 `onnxruntime-ep-openvino`（plugin，約 72 MB） | Intel 顯示驅動 |
 | `gpu`、`npu` | Intel 內顯、Intel NPU | `numpy onnxruntime-openvino==1.24.1 openvino==2025.4.*` | Intel 顯示驅動；NPU 另要 Intel NPU 驅動 |
 | `npu` | AMD NPU（Ryzen AI，實驗性） | 不是 pip 套件：安裝 AMD 的 Ryzen AI Software，用它建立的 Python 環境 | AMD NPU 驅動（隨 Ryzen AI Software）；完整版才能編譯 BF16 |
 

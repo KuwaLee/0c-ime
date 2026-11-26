@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """驗證硬體加速（設定的「硬體加速」，worker 的 --accel）在這台電腦上能不能用、結果是否與 CPU 相同。
 
-用安裝好的模型與同一個 Python（要有 numpy 與支援加速的 onnxruntime：onnxruntime-gpu、onnxruntime-rocm
-或 onnxruntime-openvino），以與引擎相同的方式啟動 worker（-I -B -X utf8、stdio 協定），
+用安裝好的模型與同一個 Python（要有 numpy 與支援加速的 onnxruntime：onnxruntime-gpu、onnxruntime-migraphx、
+onnxruntime-openvino 或 onnxruntime-ep-openvino），以與引擎相同的方式啟動 worker（-I -B -X utf8、stdio 協定），
 CPU 與加速各跑一次同一批請求，比較：
 
 - worker 就緒時回報的實際裝置與 provider（要求了加速卻是 cpu 就是不能用，原因在 stderr）

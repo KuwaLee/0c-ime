@@ -193,8 +193,9 @@ def unpad_scores(raw, inputs):
 
 
 # NPU 的 provider，依序試（Runtime 只在 onnxruntime 有這個 provider 時才試）：
-# - openvino（Intel NPU）：一個 session 收動態形狀，每個新形狀在第一次執行時編譯；關掉 CPU 退路（編譯失敗時
-#   OpenVINO 預設靜默改用自己的 CPU，比 onnxruntime 的 CPU 慢），失敗才丟例外。
+# - openvino（Intel NPU，只有舊的 onnxruntime-openvino，不用 plugin，原因見 NPU.__init__）：一個 session 收動態形狀，
+#   每個新形狀在第一次執行時編譯；關掉 CPU 退路（編譯失敗時 OpenVINO 預設靜默改用自己的 CPU，比 onnxruntime 的 CPU
+#   慢），失敗才丟例外。
 # - vitisai（AMD Ryzen AI，實驗性，未在 AMD 硬體上驗證）：NPU 編譯器要固定形狀，所以每個形狀各開一個 session，
 #   以 free dimension override 把 L、u、k、n 固定；它本來就把 NPU 不支援的運算交給 CPU，不關 CPU 退路。
 #   編譯結果放在 cache_dir（依模型雜湊分開）；部署版的 VitisAI EP 不能現場編譯 BF16，要裝完整的 Ryzen AI Software，
@@ -242,12 +243,15 @@ class NPU:
         available = set(ort.get_available_providers())
         errors = []
         for name, provider in NPU_PROVIDERS:
+            # 不用 OpenVINO 的 plugin（onnxruntime-ep-openvino 1.8.1 實測）：建 session 時就編譯、NPU 不收動態形狀，只能
+            # 每個形狀各開一個，而建 session 時不放開 GIL，每個形狀約 6 s 前景完全停住、超過期限；編譯快取讀回時又因 bool 的
+            # mask 報「Type mismatch」而失敗。所以 Intel NPU 只支援舊的 onnxruntime-openvino（GPU 兩種都可以）。
             if provider not in available:
                 continue
             try:
                 self.name, self.provider = name, provider
                 # openvino：一個動態形狀的 session 先建好；vitisai：每個形狀在背景編譯時各建一個。
-                self.shared = self._open_retry() if name == 'openvino' else None
+                self.shared = self._open_retry(None) if name == 'openvino' else None
                 break
             except Exception as e:   # noqa: BLE001 — 試下一個
                 errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
@@ -258,11 +262,12 @@ class NPU:
         self.jobs = queue.Queue()
         threading.Thread(target=self._compile_loop, daemon=True).start()
 
-    def _open_retry(self, attempts=4, wait=0.5):
-        """Intel NPU 在上一個用它的程序剛結束時約有 0.5 s 開不起來（Windows 實測；引擎交接重啟正好碰上），稍等重試。"""
+    def _open_retry(self, shape, attempts=8, wait=0.5):
+        """Intel NPU 在上一個用 OpenVINO 的程序剛結束時有 0.5–1.5 s 開不起來（Windows 實測；引擎交接重啟正好碰上），
+        稍等重試，最多約 3.5 s（還沒回報就緒，請求照常走統計引擎）。"""
         for i in range(attempts):
             try:
-                return self._session(None)
+                return self._session(shape)
             except Exception:   # noqa: BLE001
                 if i == attempts - 1:
                     raise
@@ -274,7 +279,7 @@ class NPU:
             add_openvino_dll_dir()
             options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
             # OpenVINO 自己的編譯快取：Windows 的 NPU 驅動沒有磁碟快取，每次啟動 6 個形狀要重編約 20 s
-            # （每個約 3.4 s），編譯完成前請求都走 CPU；有快取後約 0.x s。Linux 的驅動另有 ze_intel_npu_cache。
+            # （每個約 3.4 s），編譯完成前請求都走 CPU；有快取後約 5 s。Linux 的驅動另有 ze_intel_npu_cache。
             provider_options = {'device_type': 'NPU', 'cache_dir': accel_cache_dir('openvino')}
         else:
             length, proj_len = shape
@@ -342,11 +347,42 @@ GPU_PROVIDERS = (
     # 依序試，第一個建得起來的就用。一律 FP32：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN。
     # 不用 TensorRT：每個新形狀都要建引擎（數秒以上），遠超過宿主的期限。
     ('cuda', 'CUDAExecutionProvider', {'use_tf32': '0'}),   # NVIDIA；TF32 只有 10 位尾數，關掉以保持 FP32 結果
-    ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm）
-    ('rocm', 'ROCMExecutionProvider', {}),                  # AMD（舊版 onnxruntime-rocm）
+    ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm 上的 MIGraphX；ROCm EP 已被官方標為 deprecated，不用）
     ('openvino', 'OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'}),   # Intel
 )
 GPU_MAX_ERRORS = 3
+_openvino_plugin = None
+
+
+def openvino_plugin(ort):
+    """onnxruntime-ep-openvino（OpenVINO 的 plugin EP）的裝置：{'GPU': OrtEpDevice, 'NPU': …}；沒裝或載入失敗時是 {}。
+
+    plugin 掛在一般的 onnxruntime（1.23 以上）上、wheel 不分 Python 版本、自帶 OpenVINO，所以內附的 Python 與
+    onnxruntime 不必換；舊的 onnxruntime-openvino 要取代整個 onnxruntime，且只到 cp313、要配對 openvino 套件的版本。
+    兩者都裝時用舊的（provider 已在 get_available_providers 裡）。plugin 一個行程只註冊一次。
+    """
+    global _openvino_plugin
+    if _openvino_plugin is None:
+        _openvino_plugin = {}
+        try:
+            import onnxruntime_ep_openvino as plugin
+            ort.register_execution_provider_library('zc_openvino', plugin.get_library_path())
+            name = plugin.get_ep_name()
+            for device in ort.get_ep_devices():
+                kind = str(device.ep_metadata.get('ov_device', '')).split('.')[0]   # GPU、GPU.0、NPU…
+                if device.ep_name == name and kind in ('GPU', 'NPU'):
+                    _openvino_plugin.setdefault(kind, device)
+        except Exception:   # noqa: BLE001 — 沒裝 plugin、onnxruntime 太舊（沒有 plugin API）時就是沒有
+            _openvino_plugin = {}
+    return _openvino_plugin
+
+
+def openvino_plugin_options(options, device, config):
+    """把 plugin 裝置加進 SessionOptions；config 是 OpenVINO 的屬性（plugin 忽略 precision、cache_dir 等 provider 選項，
+    要以 load_config 給）。OpenVINO 編譯失敗時會靜默改用自己的 CPU，所以一律關掉 CPU 退路。"""
+    options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+    name = str(device.ep_metadata.get('ov_device', ''))
+    options.add_provider_for_devices([device], {'load_config': json.dumps({name: config})})
 
 
 def add_openvino_dll_dir():
@@ -370,22 +406,29 @@ def add_openvino_dll_dir():
 def open_gpu(ort, path):
     """依 GPU_PROVIDERS 的順序開第一個可用的 GPU session，回傳 (session, 名稱)；都不行時丟例外。
 
-    一台電腦只裝得了一種 onnxruntime（cuda、rocm、openvino 版互相取代），可用的 provider 由它決定。
+    一台電腦只裝得了一種 onnxruntime（cuda、migraphx、openvino 版互相取代），可用的 provider 由它決定；Intel 也可以是
+    一般 onnxruntime 加上 OpenVINO 的 plugin（openvino_plugin）。
     provider 建不起來時 onnxruntime 只印警告並改用 CPU，所以以 get_providers() 確認真的是那個 provider。
     """
     available = set(ort.get_available_providers())
     errors = []
     for name, provider, provider_options in GPU_PROVIDERS:
-        if provider not in available:
-            continue
         options = ort.SessionOptions()
-        if provider == 'OpenVINOExecutionProvider':
+        providers = [(provider, provider_options)]
+        if provider not in available:
+            device = openvino_plugin(ort).get('GPU') if provider == 'OpenVINOExecutionProvider' else None
+            if device is None:
+                continue
+            # OpenVINO 的 GPU 預設以 f16 計算，要明確指定 f32。
+            openvino_plugin_options(options, device, {'INFERENCE_PRECISION_HINT': 'f32'})
+            providers = None
+        elif provider == 'OpenVINOExecutionProvider':
             add_openvino_dll_dir()
             # OpenVINO 編譯失敗時會靜默改用自己的 CPU（比較慢），要它丟錯。其他 provider 本來就會把少數
             # 形狀運算分給 CPU EP，設了反而整個 session 開不起來，所以只對 OpenVINO 設。
             options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
         try:
-            session = ort.InferenceSession(path, sess_options=options, providers=[(provider, provider_options)])
+            session = ort.InferenceSession(path, sess_options=options, providers=providers)
         except Exception as e:   # noqa: BLE001 — 試下一個
             errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
             continue
@@ -523,7 +566,7 @@ class Runtime:
 # onnxruntime 有哪些 provider。「可用」不保證開得起來（驅動、plugin 有問題時仍會失敗），實際使用的裝置看就緒訊息的 accel。
 PCI_VENDORS = {'0x10de': 'nvidia', '0x1002': 'amd', '0x1022': 'amd', '0x8086': 'intel', '0x5143': 'qualcomm'}
 # provider 能用在哪些廠牌的裝置上。
-PROVIDER_VENDORS = {'cuda': {'nvidia'}, 'migraphx': {'amd'}, 'rocm': {'amd'}, 'openvino': {'intel'}, 'vitisai': {'amd'}}
+PROVIDER_VENDORS = {'cuda': {'nvidia'}, 'migraphx': {'amd'}, 'openvino': {'intel'}, 'vitisai': {'amd'}}
 NPU_DRIVERS = {'intel_vpu': ('intel', 'Intel NPU'), 'amdxdna': ('amd', 'AMD NPU')}
 VENDOR_NAMES = {'nvidia': 'NVIDIA', 'amd': 'AMD', 'intel': 'Intel', 'qualcomm': 'Qualcomm'}
 
@@ -609,14 +652,18 @@ def windows_devices():
 def probe(sys_root='/sys'):
     """回報這台的 GPU／NPU 與 onnxruntime 的 provider，以及設定的 gpu、npu 各自能不能用。"""
     out = {'probe': 1}
+    plugin = {}
     try:
         import onnxruntime as ort
         providers = list(ort.get_available_providers())
         out['onnxruntime'] = ort.__version__
+        plugin = openvino_plugin(ort)
     except Exception as e:   # noqa: BLE001 — 沒有 onnxruntime 時裝置照樣列出
         providers = []
         out['onnxruntime_error'] = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
     out['providers'] = providers
+    if plugin:
+        out['openvino_plugin'] = sorted(plugin)
     try:
         gpus, npus = windows_devices() if sys.platform == 'win32' else linux_devices(sys_root)
     except Exception as e:   # noqa: BLE001
@@ -624,7 +671,8 @@ def probe(sys_root='/sys'):
         out['devices_error'] = str(e)[:200]
     for kind, devices, table in (('gpu', gpus, GPU_PROVIDERS), ('npu', npus, NPU_PROVIDERS)):
         vendors = {d['vendor'] for d in devices}
-        usable = [entry[0] for entry in table if entry[1] in providers
+        usable = [entry[0] for entry in table
+                  if (entry[1] in providers or kind == 'gpu' and entry[0] == 'openvino' and 'GPU' in plugin)
                   and PROVIDER_VENDORS[entry[0]] & vendors]
         status = 'available' if usable and devices else 'no_device' if not devices else 'no_runtime'
         out[kind] = {'status': status, 'devices': devices, 'providers': usable}
@@ -636,7 +684,7 @@ def main():
     p.add_argument('--package', type=Path); p.add_argument('--dictionary')
     p.add_argument('--threads', type=int, default=2)
     p.add_argument('--accel', choices=ACCELS, default='cpu',
-                   help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、OpenVINO，FP32）；'
+                   help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、OpenVINO，FP32）；'
                         'npu：已編譯形狀走 NPU（OpenVINO 的 Intel NPU、VitisAI 的 AMD NPU）；裝置無法使用時走 CPU；'
                         '--probe 只偵測裝置')
     p.add_argument('--probe', action='store_true', help='只回報這台的 GPU／NPU 與可用的 provider（JSON 一行）後結束，不載入模型')
