@@ -20,6 +20,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -246,7 +247,7 @@ class NPU:
             try:
                 self.name, self.provider = name, provider
                 # openvino：一個動態形狀的 session 先建好；vitisai：每個形狀在背景編譯時各建一個。
-                self.shared = self._session(None) if name == 'openvino' else None
+                self.shared = self._open_retry() if name == 'openvino' else None
                 break
             except Exception as e:   # noqa: BLE001 — 試下一個
                 errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
@@ -257,12 +258,24 @@ class NPU:
         self.jobs = queue.Queue()
         threading.Thread(target=self._compile_loop, daemon=True).start()
 
+    def _open_retry(self, attempts=4, wait=0.5):
+        """Intel NPU 在上一個用它的程序剛結束時約有 0.5 s 開不起來（Windows 實測；引擎交接重啟正好碰上），稍等重試。"""
+        for i in range(attempts):
+            try:
+                return self._session(None)
+            except Exception:   # noqa: BLE001
+                if i == attempts - 1:
+                    raise
+                time.sleep(wait)
+
     def _session(self, shape):
         options = self.ort.SessionOptions()
         if self.name == 'openvino':
             add_openvino_dll_dir()
             options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
-            provider_options = {'device_type': 'NPU'}
+            # OpenVINO 自己的編譯快取：Windows 的 NPU 驅動沒有磁碟快取，每次啟動 6 個形狀要重編約 20 s
+            # （每個約 3.4 s），編譯完成前請求都走 CPU；有快取後約 0.x s。Linux 的驅動另有 ze_intel_npu_cache。
+            provider_options = {'device_type': 'NPU', 'cache_dir': accel_cache_dir('openvino')}
         else:
             length, proj_len = shape
             for dim, value in (('L', length), ('u', proj_len), ('k', NPU_ROWS), ('n', 1)):

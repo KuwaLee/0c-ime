@@ -37,7 +37,7 @@ build/0c-server -data assets/data \
 
 **NPU** 依序試 `NPU_PROVIDERS`：
 
-- `openvino`（Intel NPU，Core Ultra）：需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。一個 session 收動態形狀，每個新形狀第一次執行時編譯，編譯結果快取在 `~/.cache/ze_intel_npu_cache`。
+- `openvino`（Intel NPU，Core Ultra）：需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。一個 session 收動態形狀，每個新形狀第一次執行時編譯，編譯結果快取在 `~/.cache/ze_intel_npu_cache`（驅動的快取），另外 OpenVINO 自己的快取放在 `~/.cache/0c/openvino`（Windows 是 `%LOCALAPPDATA%\Zuin\cache\openvino`，6 個形狀約 580 MB）。Windows 的 NPU 驅動沒有磁碟快取，沒有 OpenVINO 快取時每次啟動要重編約 20 s（每個形狀約 3.4 s），編譯完成前的請求都走 CPU；有快取後約 5 s。Windows 上 NPU 在上一個用它的程序剛結束時約有 0.5 s 開不起來（引擎交接重啟正好碰上），worker 會稍等重試。
 - `vitisai`（AMD Ryzen AI NPU，**實驗性，沒有在 AMD 硬體上驗證過**）：需要 AMD 的 Ryzen AI Software（VitisAI EP 不在一般的 onnxruntime 套件裡），以它的 Python 環境當 worker 的 Python。Ryzen AI 1.6 起接受原本的 FP32 模型、編譯時轉成 BF16（不必量化，模型檔不變），但部署版的 EP 不能現場編譯 BF16，要完整的 Ryzen AI Software；編譯設定檔取 `ZC_VITISAI_CONFIG`，或 `RYZEN_AI_INSTALLATION_PATH` 底下的 `vaip_config.json`。NPU 編譯器要固定形狀，所以每個形狀各開一個 session（以 free dimension override 固定 `L`、`u`、`k`、`n`），編譯結果放在 `%LOCALAPPDATA%\Zuin\cache\vitisai`（Linux 是 `~/.cache/0c/vitisai`）。不關 CPU 退路：VitisAI 本來就把 NPU 不支援的運算交給 CPU。
 
 NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24：每個位置要對約 2.8 萬字的字表做 log_softmax，放不進 Intel NPU 的片上記憶體；AMD 沿用同樣的形狀）、或 NPU 無法使用時，照舊用 CPU，請求不等編譯。Intel 以 fp16、AMD 以 BF16 計算，分數與 CPU 略有差異（BF16 的範圍與 FP32 相同，不會像 fp16 一樣溢位，但精度較低，要以 `accel_check.py` 量）。
@@ -52,7 +52,7 @@ NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × 
 | 選字 `npu` | 同上 | 11.2／19.0 ms | 約 6.7／19 ms | 首選 99.8% |
 | 補標點 `gpu` | 300 段 8–200 字 | 12.2／44 ms | 5.5／16 ms | 100% |
 
-同一型號在 Windows 11（Python 3.13、`onnxruntime-openvino` 1.24.1、`openvino` 2025.4.1）以 `accel_check.py --accel gpu` 量測：選字 CPU 9.6／18.6 ms、GPU 7.3／11.3 ms（2000/2000 相同，快 1.32 倍）；補標點 CPU 15.6／57.6 ms、GPU 7.3／20.9 ms（400/400 相同，快 2.14 倍），都沒有超過期限。Windows 的登錄偵測在這台正確認出 Arc 140V 與 Intel AI Boost（NPU）。
+同一型號在 Windows 11（Python 3.13、`onnxruntime-openvino` 1.24.1、`openvino` 2025.4.1）以 `accel_check.py --accel gpu` 量測：選字 CPU 9.6／18.6 ms、GPU 7.3／11.3 ms（2000/2000 相同，快 1.32 倍）；補標點 CPU 15.6／57.6 ms、GPU 7.3／20.9 ms（400/400 相同，快 2.14 倍），都沒有超過期限。`--accel npu`（有編譯快取）：選字 CPU 10.8／23.6 ms、NPU 6.3／23.1 ms（快 1.7 倍；隨機請求首選相同 90%，DIFFERS 是 fp16 的預期結果）。Windows 的登錄偵測在這台正確認出 Arc 140V 與 Intel AI Boost（NPU）。
 
 NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的時候（例如沒有前文），8 threads 的 CPU 平均就和 NPU 差不多。
 
