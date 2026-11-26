@@ -461,14 +461,17 @@
     const shown = view.value;
     // value_disabled／value_hints：個別選項不能選、旁邊的說明（硬體加速依這台偵測到的裝置，accelItem）。
     return h('fieldset', { class: 'choices', 'aria-labelledby': labelId, disabled },
-      ...values.map((value) => h('label', { class: item.value_disabled?.[value] ? 'muted' : null },
+      ...values.map((value) => h('label', { class: [item.value_disabled?.[value] ? 'muted' : '', item.value_hints?.[value] ? 'with-hint' : ''].join(' ').trim() || null },
         h('input', {
           type: 'radio', name: item.key, value, checked: shown === value, 'data-focus': item.key + ':' + value,
           class: ask ? 'locked' : null, title: ask ? LOCKED_TITLE : null, disabled: !!item.value_disabled?.[value],
           onclick: ask ? (event) => { event.preventDefault(); if (value !== shown) ask(value); } : null,
           onchange: () => (ask ? ask(value) : change(item.key, value)),
-        }), (item.value_labels && item.value_labels[value]) || VALUE[value] || value,
-        item.value_hints?.[value] ? h('span', { class: 'muted value-hint' }, '（' + item.value_hints[value] + '）') : null)));
+        }), item.value_hints?.[value]
+          // 有說明時選項名稱與說明疊成兩行：說明是小字、限寬會換行，不把右欄撐寬。
+          ? h('span', { class: 'choice-text' }, (item.value_labels && item.value_labels[value]) || VALUE[value] || value,
+            h('span', { class: 'muted value-hint' }, item.value_hints[value]))
+          : (item.value_labels && item.value_labels[value]) || VALUE[value] || value)));
   }
 
   // 改被內建風格鎖住的項目（#318）：先把目前的內建風格複製成自訂並套用（與「輸入習慣」頁的「建立並套用」相同），
@@ -527,7 +530,7 @@
       const providers = (rt['accel_' + kind + '_providers'] || '').split(',').filter(Boolean).map((p) => ACCEL_PROVIDER[p] || p);
       switch (rt['accel_' + kind]) {
         case 'available':
-          hints[kind] = devices + (providers.length ? '：' + providers.join('、') : '');
+          hints[kind] = devices + (providers.length ? ' · ' + providers.join('、') : '');
           break;
         case 'no_runtime':
           hints[kind] = (devices ? '偵測到 ' + devices + '，' : '') + accelRuntimeHint(kind, rt['accel_' + kind + '_vendors']);

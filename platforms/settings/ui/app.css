@@ -322,5 +322,8 @@ input.port { width: 8em; }
 .style-diff li:last-child { border-bottom: 0; }
 .side { overflow-y: auto; }
 
-/* 硬體加速選項旁偵測到的裝置或不能選的原因（accelItem）。 */
-.choices .value-hint { font-size: 12px; margin-left: 4px; }
+/* 硬體加速選項下方偵測到的裝置或不能選的原因（accelItem）：小字、限寬換行，名稱與說明疊成兩行。 */
+fieldset.choices label.with-hint { align-items: flex-start; }
+fieldset.choices label.with-hint input { margin-top: 4px; }
+.choices .choice-text { display: flex; flex-direction: column; }
+.choices .value-hint { font-size: 12px; line-height: 1.4; max-width: 16em; }

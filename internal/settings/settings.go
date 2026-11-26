@@ -1063,10 +1063,8 @@ func (s Settings) EffectiveNeuralAccel() string {
 }
 
 // neuralAccelDescription 是「硬體加速」的說明。
-const neuralAccelDescription = "神經選字與補標點改用顯示卡（NVIDIA、AMD、Intel）或 NPU（Intel、AMD Ryzen AI）計算，打字時的延遲較低、少占 CPU。" +
-	"需要裝置的驅動，以及對應的推論元件（NVIDIA 用 CUDA、AMD 用 ROCm、Windows 也可用 DirectML、Intel 用 OpenVINO、AMD NPU 用 Ryzen AI Software）；" +
-	"選項旁會標出這台偵測到的裝置，沒有的選項不能選。無法使用時自動改回 CPU，首頁會顯示實際使用的裝置。顯示卡的結果與 CPU 相同；" +
-	"NPU 較省電，但只用在神經選字，部分較長的組字仍由 CPU 計算，結果與 CPU 略有差異；補標點照常用 CPU。AMD NPU 是實驗性支援"
+// 細節（各廠牌要裝什麼、NPU 只用在選字、AMD NPU 是實驗性）在 platforms/neural/README.md；選項下方另有偵測到的裝置。
+const neuralAccelDescription = "用顯示卡或 NPU 計算神經選字，打字延遲較低、少占 CPU。無法使用時自動改回 CPU"
 
 // SimplifiedHotkeyLabel 是切換「輸出簡體字」的快捷鍵（#192），設定說明與 0c-update 的文字用它；四個外殼各自比對同一組鍵。
 // 負責人在 Ctrl＋Shift＋F1～F12 裡選定 F11（#192）：兩個相鄰修飾鍵；撞到的只有冷門功能（Word 解除功能變數鎖定、
