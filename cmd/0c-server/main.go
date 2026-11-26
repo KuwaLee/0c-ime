@@ -320,7 +320,7 @@ func serve() string {
 	}
 	if *punctPackage != "" {
 		pw, punctErr := neural.OpenPunct(neural.PunctConfig{Python: *neuralPython, Script: *punctWorker, Package: *punctPackage,
-			Threads: *punctThreads, Timeout: *punctTimeout})
+			Threads: *punctThreads, Timeout: *punctTimeout, Accel: *neuralAccel})
 		if punctErr != nil {
 			lg.Printf("補標點未啟用：%v", punctErr)
 		} else {
@@ -547,6 +547,11 @@ func serve() string {
 		if selectionState == "ready" && selectionWorker != nil {
 			if accel := selectionWorker.Accel(); accel != "" {
 				info["selection_accel"] = accel
+			}
+		}
+		if punctuationState == "ready" && punctuationWorker != nil {
+			if accel := punctuationWorker.Accel(); accel != "" {
+				info["punctuation_accel"] = accel
 			}
 		}
 		if selectionState == "fallback" && selectionWorker != nil && selectionWorker.Reason() != "" {

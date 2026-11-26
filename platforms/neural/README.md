@@ -21,7 +21,7 @@ build/0c-server -data assets/data \
 
 ### Intel GPU／NPU（選用）
 
-設定的「硬體加速」（`neural-accel`，`settings.json` 的 `neural_accel`：`cpu`、`gpu`、`npu`，只有 Windows、Linux）讓選字 worker 改用 OpenVINO 的 Intel GPU 或 NPU（worker 參數 `--accel`）；預設 `cpu` 與以前相同，裝置無法使用時也照舊走 CPU，就緒訊息的 `accel` 回報實際使用的裝置（health 的 `selection_accel`，設定程式據此說明）。`0c-server -neural-accel` 可蓋過設定。補標點 worker 不受影響。兩者都需要 onnxruntime 含 OpenVINO EP（Arch：`python-onnxruntime-openvino`）；官網安裝包內附的 onnxruntime 只有 CPU，選 GPU、NPU 時照舊用 CPU。
+設定的「硬體加速」（`neural-accel`，`settings.json` 的 `neural_accel`：`cpu`、`gpu`、`npu`，只有 Windows、Linux）讓選字與補標點 worker 改用 OpenVINO 的 Intel GPU 或 NPU（worker 參數 `--accel`）；預設 `cpu` 與以前相同，裝置無法使用時也照舊走 CPU，就緒訊息的 `accel` 回報實際使用的裝置（health 的 `selection_accel`，設定程式據此說明）。`0c-server -neural-accel` 可蓋過設定。兩者都需要 onnxruntime 含 OpenVINO EP（Arch：`python-onnxruntime-openvino`）；官網安裝包內附的 onnxruntime 只有 CPU，選 GPU、NPU 時照舊用 CPU。
 
 在 Core Ultra 200V（Arc 140V）以逐鍵輸入的 3,472 個請求（前文 64 字）量測，往返延遲：
 
@@ -32,6 +32,8 @@ build/0c-server -data assets/data \
 | `npu` | 約 6.7 ms | 約 19 ms | 99.8% |
 
 **GPU**（建議）需要 OpenVINO 的 GPU plugin 與 Intel 的 OpenCL 驅動（Arch：`openvino-intel-gpu-plugin`、`intel-compute-runtime`）。以 FP32 計算、收動態形狀，不必補齊；新形狀第一次約數十 ms。FP16 不能用：遮罩以 float32 最小值相加，fp16 溢位成 inf／NaN。
+
+**補標點**只支援 GPU（FP32，`punctuation_accel` 回報實際裝置）：模型沒有遮罩輸入，補齊會改變結果，不能用 NPU 要的固定形狀，所以選 NPU 時補標點照常用 CPU。以 300 段 8–200 字的無標點文字量測，往返延遲平均 12.2 → 5.5 ms、p99 44 → 16 ms，補出的標點與 CPU 全部相同；新長度第一次最多約 80 ms，在補標點期限 150 ms 內。
 
 **NPU** 需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。
 

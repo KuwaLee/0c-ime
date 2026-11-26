@@ -23,6 +23,9 @@ type PunctConfig struct {
 	Python, Script, Package string
 	Threads                 int
 	Timeout                 time.Duration
+	// Accel 同 Config.Accel，但補標點只支援 AccelGPU：模型沒有遮罩輸入，不能補齊成 NPU 要的固定形狀，
+	// 所以 AccelNPU（與空字串、AccelCPU）照舊只用 CPU，命令列與以前相同。
+	Accel string
 }
 
 // PunctWorker 是有界的補標點評分器。worker 的啟動（載入 Python 與模型）一律在背景進行，
@@ -48,12 +51,19 @@ type punctProc struct {
 	input  io.WriteCloser
 	output *bufio.Scanner
 	done   chan struct{}
+	accel  string // worker 就緒時回報實際使用的裝置
 }
 
 func OpenPunct(c PunctConfig) (*PunctWorker, error) {
-	return openPunct(c, func() *exec.Cmd {
-		return pythonCommand(c.Python, c.Script, "--package", c.Package, "--threads", fmt.Sprint(c.Threads))
-	})
+	return openPunct(c, func() *exec.Cmd { return pythonCommand(c.Python, c.Script, punctArgs(c)...) })
+}
+
+func punctArgs(c PunctConfig) []string {
+	args := []string{"--package", c.Package, "--threads", fmt.Sprint(c.Threads)}
+	if c.Accel == AccelGPU {
+		args = append(args, "--accel", AccelGPU)
+	}
+	return args
 }
 
 // openPunct 同步核對套件，worker 在背景啟動；引擎不必等 Python 載入模型才開始服務。
@@ -63,6 +73,9 @@ func openPunct(c PunctConfig, command func() *exec.Cmd) (*PunctWorker, error) {
 	}
 	if c.Threads < 1 || c.Threads > MaxThreads {
 		return nil, errors.New("invalid punct threads")
+	}
+	if c.Accel != "" && c.Accel != AccelCPU && c.Accel != AccelNPU && c.Accel != AccelGPU {
+		return nil, errors.New("invalid punct accel")
 	}
 	b, err := os.ReadFile(filepath.Join(c.Package, "manifest.json"))
 	if err != nil {
@@ -151,6 +164,7 @@ func launchPunct(command func() *exec.Cmd, model string) (*punctProc, error) {
 		Ready  bool   `json:"ready"`
 		Schema string `json:"schema"`
 		Model  string `json:"model_sha256"`
+		Accel  string `json:"accel"`
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &ready)
@@ -161,6 +175,7 @@ func launchPunct(command func() *exec.Cmd, model string) (*punctProc, error) {
 		return nil, startupError("punct worker", err, stderr.finish())
 	}
 	stderr.finish()
+	p.accel = readyAccel(ready.Accel)
 	return p, nil
 }
 
@@ -285,6 +300,16 @@ func (w *PunctWorker) Stats() Stats { w.mu.Lock(); defer w.mu.Unlock(); return w
 func (w *PunctWorker) SetLog(f func(string, ...any)) { w.mu.Lock(); w.Log = f; w.mu.Unlock() }
 
 // State 回報當下模型可用性；不把已建立但尚未就緒的 worker 視為啟用。
+// Accel 回報目前 worker 實際使用的推論裝置；沒有可用的 worker 時為空字串。
+func (w *PunctWorker) Accel() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.proc == nil {
+		return ""
+	}
+	return w.proc.accel
+}
+
 func (w *PunctWorker) State() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()

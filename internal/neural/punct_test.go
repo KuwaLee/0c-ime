@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -188,5 +190,27 @@ func TestPunctWorkerScoresAndFallsBack(t *testing.T) {
 
 	if _, err = OpenPunct(PunctConfig{Timeout: time.Second, Threads: 1}); err == nil {
 		t.Fatal("timeout above 500ms must be rejected")
+	}
+}
+
+// 補標點只把 gpu 傳給 worker：npu 不支援（模型不能補齊成固定形狀），與 cpu 一樣照舊的命令列。
+func TestPunctAccelArgs(t *testing.T) {
+	base := PunctConfig{Package: "pkg", Threads: 2}
+	want := []string{"--package", "pkg", "--threads", "2"}
+	for _, accel := range []string{"", AccelCPU, AccelNPU} {
+		c := base
+		c.Accel = accel
+		if got := punctArgs(c); !slices.Equal(got, want) {
+			t.Fatalf("accel %q: %v", accel, got)
+		}
+	}
+	c := base
+	c.Accel = AccelGPU
+	if got := punctArgs(c); !slices.Equal(got, append(slices.Clone(want), "--accel", "gpu")) {
+		t.Fatalf("gpu: %v", got)
+	}
+	c.Accel, c.Timeout = "vulkan", 50*time.Millisecond
+	if _, err := openPunct(c, nil); err == nil || !strings.Contains(err.Error(), "accel") {
+		t.Fatalf("unknown accel accepted: %v", err)
 	}
 }

@@ -25,7 +25,7 @@ func modelStatus(dial autoupdate.Dialer) map[string]any {
 		}
 		state[key] = value
 	}
-	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel"} {
+	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel", "punctuation_accel"} {
 		if info[key] != "" {
 			state[key] = info[key]
 		}
@@ -48,7 +48,7 @@ func printModelStatus(w io.Writer, state map[string]any) {
 	default:
 		fmt.Fprintf(w, "模型運作狀態（引擎 %s）：\n神經選字：%s\n補標點：%s\n",
 			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"])+accelLabel(state["selection_accel"]),
-			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"]))
+			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"])+accelLabel(state["punctuation_accel"]))
 	}
 }
 

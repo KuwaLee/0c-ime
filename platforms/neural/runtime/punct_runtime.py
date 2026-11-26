@@ -58,8 +58,32 @@ def eligible_boundaries(text):
     return allowed
 
 
+def add_openvino_dll_dir():
+    """Windows：onnxruntime-openvino 的 provider DLL 依賴 openvino 套件的 DLL（openvino\\libs），不在預設搜尋路徑。
+
+    與 sequence_runtime.py 相同（worker 以 -I 執行，不能 import 同目錄的模組）：找不到就不做事，建立 session 失敗後照舊用 CPU。
+    """
+    if sys.platform != 'win32':
+        return
+    import importlib.util
+    spec = importlib.util.find_spec('openvino')
+    for root in (spec.submodule_search_locations or []) if spec else []:
+        libs = os.path.join(root, 'libs')
+        if os.path.isdir(libs):
+            os.add_dll_directory(libs)
+            os.environ['PATH'] = libs + os.pathsep + os.environ.get('PATH', '')
+            return
+
+
 class Runtime:
-    def __init__(self, package, threads=2):
+    """accel='gpu'：另開 OpenVINO Intel GPU session（FP32，與 CPU 的補標點結果相同）；開不起來時只用 CPU。
+
+    這個模型沒有遮罩輸入，補齊會改變結果，所以不支援要求固定形狀的 NPU。GPU 執行出錯或機率非有限值時，
+    這一窗改用 CPU；連續出錯 GPU_MAX_ERRORS 次即停用 GPU。
+    """
+    GPU_MAX_ERRORS = 3
+
+    def __init__(self, package, threads=2, accel='cpu'):
         import onnxruntime as ort
         if hasattr(ort, 'disable_telemetry_events'):   # 再保險一次：之後的 session 與推論事件也不記
             ort.disable_telemetry_events()
@@ -82,15 +106,43 @@ class Runtime:
         options.add_session_config_entry('session.intra_op.allow_spinning', '0')
         self.session = ort.InferenceSession(str(package / 'model.onnx'), sess_options=options, providers=['CPUExecutionProvider'])
         self.model_sha = m['files']['model.onnx']
+        self.gpu, self.gpu_errors = None, 0
+        if accel == 'gpu':
+            try:
+                add_openvino_dll_dir()
+                gpu_options = ort.SessionOptions()
+                gpu_options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+                gpu = ort.InferenceSession(str(package / 'model.onnx'), sess_options=gpu_options,
+                                           providers=[('OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'})])
+                if gpu.get_providers()[0] != 'OpenVINOExecutionProvider':
+                    raise RuntimeError('openvino_gpu_unavailable')
+                self.gpu = gpu
+            except Exception as e:   # noqa: BLE001 — 裝置無法使用時照舊只用 CPU
+                print(f'gpu unavailable, using cpu: {e}', file=sys.stderr, flush=True)
+
+    def run(self, inputs):
+        """GPU 可用時用 GPU，出錯或非有限值時這一次改用 CPU。"""
+        if self.gpu is not None and self.gpu_errors < self.GPU_MAX_ERRORS:
+            try:
+                probs = self.gpu.run(['probs'], inputs)[0]
+                if not np.isfinite(probs).all():
+                    raise ValueError('nonfinite_probs')
+                self.gpu_errors = 0
+                return probs
+            except Exception as e:   # noqa: BLE001
+                self.gpu_errors += 1
+                if self.gpu_errors == self.GPU_MAX_ERRORS:
+                    print(f'gpu disabled, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
+        return self.session.run(['probs'], inputs)[0]
 
     def window_probs(self, text):
         src = [self.chars.get(c, 4) for c in text]
         if self.input == 'bidirectional':
             ids = np.array([[1, 7] + src], dtype=np.int64)
-            return self.session.run(['probs'], {'ids': ids})[0][2:]
+            return self.run({'ids': ids})[2:]
         ids = np.array([[1, 7] + src + [2] + src], dtype=np.int64)
         types = np.array([[0] * (len(src) + 3) + [2] * len(src)], dtype=np.int64)
-        probs = self.session.run(['probs'], {'ids': ids, 'types': types})[0]
+        probs = self.run({'ids': ids, 'types': types})
         return probs[len(src) + 3:]
 
     def probabilities(self, text):
@@ -126,12 +178,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--package', type=Path, required=True)
     p.add_argument('--threads', type=int, default=2)
+    p.add_argument('--accel', choices=('cpu', 'gpu'), default='cpu', help='gpu：OpenVINO Intel GPU（FP32）；無法使用時走 CPU')
     a = p.parse_args()
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')
-    runtime = Runtime(a.package, a.threads)
+    runtime = Runtime(a.package, a.threads, a.accel)
     runtime.edits('暖機只用固定字串不含使用者文字')
-    print(json.dumps({'ready': True, 'schema': SCHEMA, 'model_sha256': runtime.model_sha}), flush=True)
+    # accel：實際使用的裝置（宿主的 health 回報 punctuation_accel）。
+    print(json.dumps({'ready': True, 'schema': SCHEMA, 'model_sha256': runtime.model_sha,
+                      'accel': 'gpu' if runtime.gpu is not None else 'cpu'}), flush=True)
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 1)
         if not line:
