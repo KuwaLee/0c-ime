@@ -101,7 +101,7 @@ func listSettings(w io.Writer, r settings.Report, path string) {
 		fmt.Fprintf(w, "caps-lock-english=%s（Caps Lock 開著時直接打英文：字母大寫、數字與符號半形，關掉回到注音；關閉時注音模式不理 Caps Lock）\n", onOff(s.CapsLockEnglish))
 	}
 	if settings.NeuralAccelSetting(runtime.GOOS) {
-		fmt.Fprintf(w, "neural-accel=%s（硬體加速：cpu 不使用；gpu 顯示卡（CUDA、ROCm、DirectML 或 OpenVINO，依安裝的推論元件）；npu NPU（Intel 用 OpenVINO、AMD 用 Ryzen AI）。無法使用時改回 CPU；可用的裝置見 status）\n", s.NeuralAccel)
+		fmt.Fprintf(w, "neural-accel=%s（硬體加速：cpu 不使用；gpu 顯示卡（CUDA、ROCm 或 OpenVINO，依安裝的推論元件）；npu NPU（Intel 用 OpenVINO、AMD 用 Ryzen AI）。無法使用時改回 CPU；可用的裝置見 status）\n", s.NeuralAccel)
 	}
 	fmt.Fprintf(w, "toneless=%s（不打聲調也能選字：沒打聲調的字依前後文決定，有打的照聲調，組字中的 ' 切字；只在標準排列有效；開啟時中英混打停用）\n", onOff(s.Toneless))
 	fmt.Fprintf(w, "keyboard-layout=%s（鍵盤排列：standard 標準；eten 倚天 41 鍵，這時不提供 Emoji 選單與中英混打；hsu 許氏，這時不提供中英混打；pinyin 漢語拼音，數字標調、這時不提供中英混打）\n", s.KeyboardLayout)

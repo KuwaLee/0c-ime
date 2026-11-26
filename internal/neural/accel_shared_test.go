@@ -56,7 +56,7 @@ func TestAccelSharedBlockIdentical(t *testing.T) {
 
 func TestReadyProvider(t *testing.T) {
 	for _, c := range []struct{ accel, in, want string }{
-		{AccelGPU, "cuda", "cuda"}, {AccelGPU, "directml", "directml"}, {AccelNPU, "openvino", "openvino"},
+		{AccelGPU, "cuda", "cuda"}, {AccelGPU, "openvino", "openvino"}, {AccelGPU, "directml", ""}, {AccelNPU, "openvino", "openvino"},
 		{AccelGPU, "tensorrt", ""}, {AccelGPU, "", ""}, {AccelCPU, "cuda", ""},
 	} {
 		if got := readyProvider(c.accel, c.in); got != c.want {

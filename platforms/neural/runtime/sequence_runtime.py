@@ -331,7 +331,6 @@ GPU_PROVIDERS = (
     ('cuda', 'CUDAExecutionProvider', {'use_tf32': '0'}),   # NVIDIA；TF32 只有 10 位尾數，關掉以保持 FP32 結果
     ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm）
     ('rocm', 'ROCMExecutionProvider', {}),                  # AMD（舊版 onnxruntime-rocm）
-    ('directml', 'DmlExecutionProvider', {}),               # Windows，任何 DirectX 12 顯示卡
     ('openvino', 'OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'}),   # Intel
 )
 GPU_MAX_ERRORS = 3
@@ -358,7 +357,7 @@ def add_openvino_dll_dir():
 def open_gpu(ort, path):
     """依 GPU_PROVIDERS 的順序開第一個可用的 GPU session，回傳 (session, 名稱)；都不行時丟例外。
 
-    一台電腦只裝得了一種 onnxruntime（cuda、rocm、directml、openvino 版互相取代），可用的 provider 由它決定。
+    一台電腦只裝得了一種 onnxruntime（cuda、rocm、openvino 版互相取代），可用的 provider 由它決定。
     provider 建不起來時 onnxruntime 只印警告並改用 CPU，所以以 get_providers() 確認真的是那個 provider。
     """
     available = set(ort.get_available_providers())
@@ -366,13 +365,12 @@ def open_gpu(ort, path):
     for name, provider, provider_options in GPU_PROVIDERS:
         if provider not in available:
             continue
+        options = ort.SessionOptions()
         if provider == 'OpenVINOExecutionProvider':
             add_openvino_dll_dir()
-        options = ort.SessionOptions()
-        options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
-        if provider == 'DmlExecutionProvider':   # DirectML 不支援記憶體模式與平行執行
-            options.enable_mem_pattern = False
-            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # OpenVINO 編譯失敗時會靜默改用自己的 CPU（比較慢），要它丟錯。其他 provider 本來就會把少數
+            # 形狀運算分給 CPU EP，設了反而整個 session 開不起來，所以只對 OpenVINO 設。
+            options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
         try:
             session = ort.InferenceSession(path, sess_options=options, providers=[(provider, provider_options)])
         except Exception as e:   # noqa: BLE001 — 試下一個
@@ -511,9 +509,8 @@ class Runtime:
 # 只看兩件事：作業系統列出的裝置（Linux 的 /sys、Windows 登錄的 Display 與 ComputeAccelerator 裝置類別），以及已安裝的
 # onnxruntime 有哪些 provider。「可用」不保證開得起來（驅動、plugin 有問題時仍會失敗），實際使用的裝置看就緒訊息的 accel。
 PCI_VENDORS = {'0x10de': 'nvidia', '0x1002': 'amd', '0x1022': 'amd', '0x8086': 'intel', '0x5143': 'qualcomm'}
-# provider 能用在哪些廠牌的裝置上（directml 是 Windows 上任何 DirectX 12 顯示卡）。
-PROVIDER_VENDORS = {'cuda': {'nvidia'}, 'migraphx': {'amd'}, 'rocm': {'amd'}, 'directml': None, 'openvino': {'intel'},
-                    'vitisai': {'amd'}}
+# provider 能用在哪些廠牌的裝置上。
+PROVIDER_VENDORS = {'cuda': {'nvidia'}, 'migraphx': {'amd'}, 'rocm': {'amd'}, 'openvino': {'intel'}, 'vitisai': {'amd'}}
 NPU_DRIVERS = {'intel_vpu': ('intel', 'Intel NPU'), 'amdxdna': ('amd', 'AMD NPU')}
 VENDOR_NAMES = {'nvidia': 'NVIDIA', 'amd': 'AMD', 'intel': 'Intel', 'qualcomm': 'Qualcomm'}
 
@@ -615,7 +612,7 @@ def probe(sys_root='/sys'):
     for kind, devices, table in (('gpu', gpus, GPU_PROVIDERS), ('npu', npus, NPU_PROVIDERS)):
         vendors = {d['vendor'] for d in devices}
         usable = [entry[0] for entry in table if entry[1] in providers
-                  and (PROVIDER_VENDORS[entry[0]] is None or PROVIDER_VENDORS[entry[0]] & vendors)]
+                  and PROVIDER_VENDORS[entry[0]] & vendors]
         status = 'available' if usable and devices else 'no_device' if not devices else 'no_runtime'
         out[kind] = {'status': status, 'devices': devices, 'providers': usable}
     return out
@@ -626,7 +623,7 @@ def main():
     p.add_argument('--package', type=Path); p.add_argument('--dictionary')
     p.add_argument('--threads', type=int, default=2)
     p.add_argument('--accel', choices=ACCELS, default='cpu',
-                   help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、DirectML、OpenVINO，FP32）；'
+                   help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、OpenVINO，FP32）；'
                         'npu：已編譯形狀走 NPU（OpenVINO 的 Intel NPU、VitisAI 的 AMD NPU）；裝置無法使用時走 CPU；'
                         '--probe 只偵測裝置')
     p.add_argument('--probe', action='store_true', help='只回報這台的 GPU／NPU 與可用的 provider（JSON 一行）後結束，不載入模型')

@@ -70,7 +70,6 @@ GPU_PROVIDERS = (
     ('cuda', 'CUDAExecutionProvider', {'use_tf32': '0'}),   # NVIDIA；TF32 只有 10 位尾數，關掉以保持 FP32 結果
     ('migraphx', 'MIGraphXExecutionProvider', {}),          # AMD（ROCm）
     ('rocm', 'ROCMExecutionProvider', {}),                  # AMD（舊版 onnxruntime-rocm）
-    ('directml', 'DmlExecutionProvider', {}),               # Windows，任何 DirectX 12 顯示卡
     ('openvino', 'OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'}),   # Intel
 )
 GPU_MAX_ERRORS = 3
@@ -97,7 +96,7 @@ def add_openvino_dll_dir():
 def open_gpu(ort, path):
     """依 GPU_PROVIDERS 的順序開第一個可用的 GPU session，回傳 (session, 名稱)；都不行時丟例外。
 
-    一台電腦只裝得了一種 onnxruntime（cuda、rocm、directml、openvino 版互相取代），可用的 provider 由它決定。
+    一台電腦只裝得了一種 onnxruntime（cuda、rocm、openvino 版互相取代），可用的 provider 由它決定。
     provider 建不起來時 onnxruntime 只印警告並改用 CPU，所以以 get_providers() 確認真的是那個 provider。
     """
     available = set(ort.get_available_providers())
@@ -105,13 +104,12 @@ def open_gpu(ort, path):
     for name, provider, provider_options in GPU_PROVIDERS:
         if provider not in available:
             continue
+        options = ort.SessionOptions()
         if provider == 'OpenVINOExecutionProvider':
             add_openvino_dll_dir()
-        options = ort.SessionOptions()
-        options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
-        if provider == 'DmlExecutionProvider':   # DirectML 不支援記憶體模式與平行執行
-            options.enable_mem_pattern = False
-            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # OpenVINO 編譯失敗時會靜默改用自己的 CPU（比較慢），要它丟錯。其他 provider 本來就會把少數
+            # 形狀運算分給 CPU EP，設了反而整個 session 開不起來，所以只對 OpenVINO 設。
+            options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
         try:
             session = ort.InferenceSession(path, sess_options=options, providers=[(provider, provider_options)])
         except Exception as e:   # noqa: BLE001 — 試下一個
@@ -253,7 +251,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--package', type=Path, required=True)
     p.add_argument('--threads', type=int, default=2)
-    p.add_argument('--accel', choices=('cpu', 'gpu'), default='cpu', help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、DirectML、OpenVINO，FP32）；無法使用時走 CPU')
+    p.add_argument('--accel', choices=('cpu', 'gpu'), default='cpu', help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、OpenVINO，FP32）；無法使用時走 CPU')
     a = p.parse_args()
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')

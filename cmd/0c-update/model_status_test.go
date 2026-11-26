@@ -116,7 +116,7 @@ func TestModelStatusExplainsRuntimeMissingAndUserModel(t *testing.T) {
 
 func TestAccelLabel(t *testing.T) {
 	for _, c := range []struct{ accel, provider, want string }{
-		{"gpu", "cuda", "（GPU 加速，NVIDIA CUDA）"}, {"gpu", "directml", "（GPU 加速，DirectML）"},
+		{"gpu", "cuda", "（GPU 加速，NVIDIA CUDA）"}, {"gpu", "openvino", "（GPU 加速，Intel OpenVINO）"},
 		{"gpu", "", "（GPU 加速）"}, {"npu", "openvino", "（NPU 加速，Intel OpenVINO）"}, {"npu", "vitisai", "（NPU 加速，AMD Ryzen AI）"}, {"cpu", "", ""}, {"", "", ""},
 	} {
 		if got := accelLabel(c.accel, c.provider); got != c.want {

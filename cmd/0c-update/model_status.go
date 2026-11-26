@@ -132,7 +132,7 @@ func accelLabel(value, provider any) string {
 }
 
 // providerNames 是 provider 代碼的顯示名稱（與設定程式的 ACCEL_PROVIDER 相同）。
-var providerNames = map[string]string{"cuda": "NVIDIA CUDA", "migraphx": "AMD MIGraphX", "rocm": "AMD ROCm", "directml": "DirectML", "openvino": "Intel OpenVINO", "vitisai": "AMD Ryzen AI"}
+var providerNames = map[string]string{"cuda": "NVIDIA CUDA", "migraphx": "AMD MIGraphX", "rocm": "AMD ROCm","openvino": "Intel OpenVINO", "vitisai": "AMD Ryzen AI"}
 
 // probeLine 列出硬體加速偵測的結果（health 的 accel_*）；引擎沒有偵測（舊版、沒有選字 worker）時為空字串。
 func probeLine(state map[string]any) string {

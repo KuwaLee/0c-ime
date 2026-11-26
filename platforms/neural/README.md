@@ -29,7 +29,6 @@ build/0c-server -data assets/data \
 |---|---|---|
 | `cuda`（CUDA EP，關掉 TF32） | NVIDIA | Arch `python-onnxruntime-cuda`；pip `onnxruntime-gpu` |
 | `migraphx`、`rocm` | AMD（ROCm 支援的型號） | Arch `python-onnxruntime-rocm`；pip `onnxruntime-rocm` |
-| `directml` | Windows 上任何 DirectX 12 顯示卡 | pip `onnxruntime-directml` |
 | `openvino`（`device_type` GPU） | Intel | Arch 自行打包的 `python-onnxruntime-openvino` 加 `openvino-intel-gpu-plugin`、`intel-compute-runtime`；pip `onnxruntime-openvino`（Windows 另要 `openvino`） |
 
 一台電腦只裝得了一種 onnxruntime（這些套件互相取代），可用的 provider 由它決定。一律以 FP32 計算、收動態形狀：遮罩以 float32 最小值相加，fp16 會溢位成 inf／NaN；不用 TensorRT，因為每個新形狀都要建引擎（數秒以上）。GPU 在常駐的背景執行緒上跑（`Offload`），每個請求最多等 30 ms（補標點每一窗 50 ms），沒等到就這一次用 CPU、GPU 在背景跑完當作暖機，所以新形狀編譯很久的 provider 也不會讓引擎逾時。
@@ -43,7 +42,7 @@ build/0c-server -data assets/data \
 
 NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24：每個位置要對約 2.8 萬字的字表做 log_softmax，放不進 Intel NPU 的片上記憶體；AMD 沿用同樣的形狀）、或 NPU 無法使用時，照舊用 CPU，請求不等編譯。Intel 以 fp16、AMD 以 BF16 計算，分數與 CPU 略有差異（BF16 的範圍與 FP32 相同，不會像 fp16 一樣溢位，但精度較低，要以 `accel_check.py` 量）。
 
-**偵測**：引擎啟動後在背景以選字 worker 的 Python 跑一次 `sequence_runtime.py --probe`（不載入模型，約 0.2 秒），回報這台的裝置與 onnxruntime 的 provider，放進 health 的 `accel_probe`、`accel_gpu`／`accel_npu`（`available`、`no_device`、`no_runtime`）、`accel_*_devices`、`accel_*_vendors`、`accel_*_providers`（`neural.Probe`）。裝置來自 Linux 的 `/sys/bus/pci/devices`（PCI class 0x03 的顯示控制器）與 `/sys/class/accel`（驅動是 `intel_vpu` 或 `amdxdna` 的 NPU），Windows 的登錄裝置類別 `Display` 與 `ComputeAccelerator`（「神經處理器」；Windows 這一段沒有實機驗證過）。provider 依廠牌配對：`cuda`→NVIDIA、`migraphx`／`rocm`／`vitisai`→AMD、`openvino`→Intel、`directml`→任何顯示卡。設定程式據此在「硬體加速」的選項旁標出偵測到的裝置，沒有裝置或推論元件不支援的選項不能選（目前選著的除外），`0c-update status` 也列出偵測結果。偵測只代表「應該能用」，驅動或 plugin 有問題時仍可能開不起來，實際使用的裝置看 `*_accel`。
+**偵測**：引擎啟動後在背景以選字 worker 的 Python 跑一次 `sequence_runtime.py --probe`（不載入模型，約 0.2 秒），回報這台的裝置與 onnxruntime 的 provider，放進 health 的 `accel_probe`、`accel_gpu`／`accel_npu`（`available`、`no_device`、`no_runtime`）、`accel_*_devices`、`accel_*_vendors`、`accel_*_providers`（`neural.Probe`）。裝置來自 Linux 的 `/sys/bus/pci/devices`（PCI class 0x03 的顯示控制器）與 `/sys/class/accel`（驅動是 `intel_vpu` 或 `amdxdna` 的 NPU），Windows 的登錄裝置類別 `Display` 與 `ComputeAccelerator`（「神經處理器」；Windows 這一段沒有實機驗證過）。provider 依廠牌配對：`cuda`→NVIDIA、`migraphx`／`rocm`／`vitisai`→AMD、`openvino`→Intel。設定程式據此在「硬體加速」的選項旁標出偵測到的裝置，沒有裝置或推論元件不支援的選項不能選（目前選著的除外），`0c-update status` 也列出偵測結果。偵測只代表「應該能用」，驅動或 plugin 有問題時仍可能開不起來，實際使用的裝置看 `*_accel`。
 
 在 Core Ultra 200V（Arc 140V，`openvino`）量測，往返延遲：
 
@@ -52,6 +51,8 @@ NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × 
 | 選字 `gpu` | 逐鍵輸入 3,472 個（前文 64 字） | 11.2／19.0 ms | 4.6／6.6 ms | 首選 100% |
 | 選字 `npu` | 同上 | 11.2／19.0 ms | 約 6.7／19 ms | 首選 99.8% |
 | 補標點 `gpu` | 300 段 8–200 字 | 12.2／44 ms | 5.5／16 ms | 100% |
+
+同一型號在 Windows 11（Python 3.13、`onnxruntime-openvino` 1.24.1、`openvino` 2025.4.1）以 `accel_check.py --accel gpu` 量測：選字 CPU 9.6／18.6 ms、GPU 7.3／11.3 ms（2000/2000 相同，快 1.32 倍）；補標點 CPU 15.6／57.6 ms、GPU 7.3／20.9 ms（400/400 相同，快 2.14 倍），都沒有超過期限。Windows 的登錄偵測在這台正確認出 Arc 140V 與 Intel AI Boost（NPU）。
 
 NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的時候（例如沒有前文），8 threads 的 CPU 平均就和 NPU 差不多。
 
@@ -77,12 +78,11 @@ NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的
 
 | 選項 | 裝置 | pip 套件 | 驅動與執行階段 |
 |---|---|---|---|
-| `gpu` | 任何 DirectX 12 顯示卡（NVIDIA、AMD、Intel） | `numpy onnxruntime-directml` | 顯示卡驅動（DirectML 隨套件附） |
 | `gpu` | NVIDIA（CUDA） | `numpy onnxruntime-gpu` | NVIDIA 驅動，以及 onnxruntime 版本要求的 CUDA 12 與 cuDNN 9 |
-| `gpu`、`npu` | Intel 內顯、Intel NPU | `numpy onnxruntime-openvino==1.24.1 openvino` | Intel 顯示驅動；NPU 另要 Intel NPU 驅動 |
+| `gpu`、`npu` | Intel 內顯、Intel NPU | `numpy onnxruntime-openvino==1.24.1 openvino==2025.4.*` | Intel 顯示驅動；NPU 另要 Intel NPU 驅動 |
 | `npu` | AMD NPU（Ryzen AI，實驗性） | 不是 pip 套件：安裝 AMD 的 Ryzen AI Software，用它建立的 Python 環境 | AMD NPU 驅動（隨 Ryzen AI Software）；完整版才能編譯 BF16 |
 
-`onnxruntime-openvino` 在 Windows 需要 `openvino` 套件的 DLL，worker 會自己把 `openvino\libs` 加進 DLL 搜尋路徑。這些套件互相取代，一個 Python 環境只裝一種。
+`onnxruntime-openvino` 在 Windows 需要 `openvino` 套件的 DLL，worker 會自己把 `openvino\libs` 加進 DLL 搜尋路徑。`openvino` 的版本要與 `onnxruntime-openvino` 建置時的相同（1.24.1 對 2025.4）：裝了最新的 2026.x 時 provider 會靜默載入失敗、只剩 CPU，`get_available_providers()` 卻仍列出 `OpenVINOExecutionProvider`，`accel_check.py` 會回報 FAIL。DirectML（`onnxruntime-directml`）已進入維護模式，不支援；在 Arc 140V 實測也不比 CPU 快。這些套件互相取代，一個 Python 環境只裝一種。
 
 #### 驗證（`accel_check.py`）
 
