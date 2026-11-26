@@ -137,7 +137,7 @@ type Config struct {
 	Threads                                   int
 	Timeout                                   time.Duration
 	// Accel 是 worker 的硬體加速裝置：空字串或 AccelCPU 照舊只用 CPU（命令列與以前相同）；AccelNPU、AccelGPU 讓
-	// sequence_runtime.py 改用 OpenVINO 的 Intel NPU 或 GPU，裝置無法使用或不支援的請求仍走 CPU。
+	// sequence_runtime.py 改用 NPU（OpenVINO、VitisAI）或 GPU（GPU_PROVIDERS），裝置無法使用或不支援的請求仍走 CPU。
 	Accel string
 }
 
@@ -392,8 +392,9 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 	return w, nil
 }
 
-// Providers 是 worker 會回報的加速 provider（sequence_runtime.py、punct_runtime.py 的 GPU_PROVIDERS 與 NPU 的 openvino）。
-var Providers = []string{"cuda", "migraphx", "rocm", "directml", "openvino"}
+// Providers 是 worker 會回報的加速 provider：GPU_PROVIDERS（兩個 worker 的 accel-shared 區塊）依序，再加上只用在
+// NPU 的 vitisai（sequence_runtime.py 的 NPU_PROVIDERS；openvino 兩邊都有）。
+var Providers = []string{"cuda", "migraphx", "rocm", "directml", "openvino", "vitisai"}
 
 // readyProvider：CPU 時沒有 provider；不認得的值不轉交（health 只放已知的代碼）。
 func readyProvider(accel, v string) string {

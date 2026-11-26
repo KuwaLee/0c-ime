@@ -95,11 +95,11 @@
   // worker 已改回 CPU。設定剛改、引擎還沒重新啟動（pending）時不下結論。補標點只支援 GPU（模型不能補齊成 NPU 的
   // 固定形狀），選 NPU 時補標點照常用 CPU，不算無法使用。
   // provider 代碼的顯示名稱（與 0c-update 的 providerNames 相同）。
-  const ACCEL_PROVIDER = { cuda: 'NVIDIA CUDA', migraphx: 'AMD MIGraphX', rocm: 'AMD ROCm', directml: 'DirectML', openvino: 'Intel OpenVINO' };
+  const ACCEL_PROVIDER = { cuda: 'NVIDIA CUDA', migraphx: 'AMD MIGraphX', rocm: 'AMD ROCm', directml: 'DirectML', openvino: 'Intel OpenVINO', vitisai: 'AMD Ryzen AI' };
   function accelNote(modelState, accel, provider, supported) {
     if (modelState !== 'ready') return '';
     if (accel === 'gpu') return ACCEL_PROVIDER[provider] ? '（GPU 加速，' + ACCEL_PROVIDER[provider] + '）' : '（GPU 加速）';
-    if (accel === 'npu') return '（NPU 加速，Intel OpenVINO）';
+    if (accel === 'npu') return ACCEL_PROVIDER[provider] ? '（NPU 加速，' + ACCEL_PROVIDER[provider] + '）' : '（NPU 加速）';
     const wanted = (state.settings?.items || []).find((item) => item.key === 'neural-accel');
     if (wanted && !wanted.pending && supported.includes(wanted.value) && accel === 'cpu') {
       return '（硬體加速無法使用，以 CPU 計算）';
@@ -459,14 +459,16 @@
     }
     // 選項也畫實際使用的值：不用 Shift 時開始模式固定為注音（#184，item.effective），設定檔裡的英文保留到改回 Shift。
     const shown = view.value;
+    // value_disabled／value_hints：個別選項不能選、旁邊的說明（硬體加速依這台偵測到的裝置，accelItem）。
     return h('fieldset', { class: 'choices', 'aria-labelledby': labelId, disabled },
-      ...values.map((value) => h('label', {},
+      ...values.map((value) => h('label', { class: item.value_disabled?.[value] ? 'muted' : null },
         h('input', {
           type: 'radio', name: item.key, value, checked: shown === value, 'data-focus': item.key + ':' + value,
-          class: ask ? 'locked' : null, title: ask ? LOCKED_TITLE : null,
+          class: ask ? 'locked' : null, title: ask ? LOCKED_TITLE : null, disabled: !!item.value_disabled?.[value],
           onclick: ask ? (event) => { event.preventDefault(); if (value !== shown) ask(value); } : null,
           onchange: () => (ask ? ask(value) : change(item.key, value)),
-        }), (item.value_labels && item.value_labels[value]) || VALUE[value] || value)));
+        }), (item.value_labels && item.value_labels[value]) || VALUE[value] || value,
+        item.value_hints?.[value] ? h('span', { class: 'muted value-hint' }, '（' + item.value_hints[value] + '）') : null)));
   }
 
   // 改被內建風格鎖住的項目（#318）：先把目前的內建風格複製成自訂並套用（與「輸入習慣」頁的「建立並套用」相同），
@@ -506,7 +508,41 @@
     return active ? '由「' + active.name + '」風格決定' : '由目前的輸入習慣決定';
   }
 
+  // 硬體加速（neural-accel）依引擎的偵測（health 的 accel_*，neural.Probe）標出這台的裝置：沒有裝置或推論元件不支援的
+  // 選項不能選（目前選著的除外，才看得到為什麼沒作用），旁邊寫原因。引擎沒偵測（舊版、只用統計引擎、沒有模型）時照原樣。
+  function accelRuntimeHint(kind, vendors) {
+    const v = (vendors || '').split(',');
+    if (kind === 'npu') return v.includes('amd') ? '需要 AMD Ryzen AI Software' : v.includes('intel') ? '需要 OpenVINO 版的推論元件與 NPU 驅動' : '這種 NPU 不支援';
+    if (v.includes('nvidia')) return '需要 CUDA 版的推論元件（Windows 也可用 DirectML 版）';
+    if (v.includes('amd')) return '需要 ROCm 版的推論元件（Windows 也可用 DirectML 版）';
+    if (v.includes('intel')) return '需要 OpenVINO 版的推論元件（Windows 也可用 DirectML 版）';
+    return '需要支援這張顯示卡的推論元件';
+  }
+  function accelItem(item) {
+    const rt = state.status?.runtime || {};
+    if (item.key !== 'neural-accel' || rt.accel_probe !== 'ok') return item;
+    const disabled = {}, hints = {};
+    for (const kind of ['gpu', 'npu']) {
+      const devices = rt['accel_' + kind + '_devices'] || '';
+      const providers = (rt['accel_' + kind + '_providers'] || '').split(',').filter(Boolean).map((p) => ACCEL_PROVIDER[p] || p);
+      switch (rt['accel_' + kind]) {
+        case 'available':
+          hints[kind] = devices + (providers.length ? '：' + providers.join('、') : '');
+          break;
+        case 'no_runtime':
+          hints[kind] = (devices ? '偵測到 ' + devices + '，' : '') + accelRuntimeHint(kind, rt['accel_' + kind + '_vendors']);
+          disabled[kind] = item.value !== kind;
+          break;
+        default:
+          hints[kind] = '這台電腦沒有偵測到' + (kind === 'npu' ? ' NPU' : '顯示卡');
+          disabled[kind] = item.value !== kind;
+      }
+    }
+    return { ...item, value_disabled: disabled, value_hints: hints };
+  }
+
   function itemRow(item, locked) {
+    item = accelItem(item);
     const name = h('span', {}, item.label || item.key);
     if (item.locked) name.append(h('span', { class: 'badge muted-badge', title: LOCKED_TITLE }, profileLockLabel()));
     if (item.disabled && item.disabled_reason) name.append(h('span', { class: 'badge muted-badge' }, item.disabled_reason));

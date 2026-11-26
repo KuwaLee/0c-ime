@@ -36,7 +36,14 @@ build/0c-server -data assets/data \
 
 **補標點**只支援 GPU：模型沒有遮罩輸入，補齊會改變結果，不能用 NPU 要的固定形狀，所以選 NPU 時補標點照常用 CPU。
 
-**NPU** 只有 Intel（OpenVINO 的 `device_type` NPU），需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24：每個位置要對約 2.8 萬字的字表做 log_softmax，放不進 NPU 的片上記憶體）、或 NPU 無法使用時，照舊用 CPU，請求不等編譯。NPU 以 fp16 計算，分數與 CPU 略有差異。編譯結果快取在 `~/.cache/ze_intel_npu_cache`。AMD Ryzen AI 的 NPU（VitisAI EP）要先把模型量化、編譯成它的格式，模型檔會變，不在這裡支援。
+**NPU** 依序試 `NPU_PROVIDERS`：
+
+- `openvino`（Intel NPU，Core Ultra）：需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。一個 session 收動態形狀，每個新形狀第一次執行時編譯，編譯結果快取在 `~/.cache/ze_intel_npu_cache`。
+- `vitisai`（AMD Ryzen AI NPU，**實驗性，沒有在 AMD 硬體上驗證過**）：需要 AMD 的 Ryzen AI Software（VitisAI EP 不在一般的 onnxruntime 套件裡），以它的 Python 環境當 worker 的 Python。Ryzen AI 1.6 起接受原本的 FP32 模型、編譯時轉成 BF16（不必量化，模型檔不變），但部署版的 EP 不能現場編譯 BF16，要完整的 Ryzen AI Software；編譯設定檔取 `ZC_VITISAI_CONFIG`，或 `RYZEN_AI_INSTALLATION_PATH` 底下的 `vaip_config.json`。NPU 編譯器要固定形狀，所以每個形狀各開一個 session（以 free dimension override 固定 `L`、`u`、`k`、`n`），編譯結果放在 `%LOCALAPPDATA%\Zuin\cache\vitisai`（Linux 是 `~/.cache/0c/vitisai`）。不關 CPU 退路：VitisAI 本來就把 NPU 不支援的運算交給 CPU。
+
+NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24：每個位置要對約 2.8 萬字的字表做 log_softmax，放不進 Intel NPU 的片上記憶體；AMD 沿用同樣的形狀）、或 NPU 無法使用時，照舊用 CPU，請求不等編譯。Intel 以 fp16、AMD 以 BF16 計算，分數與 CPU 略有差異（BF16 的範圍與 FP32 相同，不會像 fp16 一樣溢位，但精度較低，要以 `accel_check.py` 量）。
+
+**偵測**：引擎啟動後在背景以選字 worker 的 Python 跑一次 `sequence_runtime.py --probe`（不載入模型，約 0.2 秒），回報這台的裝置與 onnxruntime 的 provider，放進 health 的 `accel_probe`、`accel_gpu`／`accel_npu`（`available`、`no_device`、`no_runtime`）、`accel_*_devices`、`accel_*_vendors`、`accel_*_providers`（`neural.Probe`）。裝置來自 Linux 的 `/sys/bus/pci/devices`（PCI class 0x03 的顯示控制器）與 `/sys/class/accel`（驅動是 `intel_vpu` 或 `amdxdna` 的 NPU），Windows 的登錄裝置類別 `Display` 與 `ComputeAccelerator`（「神經處理器」；Windows 這一段沒有實機驗證過）。provider 依廠牌配對：`cuda`→NVIDIA、`migraphx`／`rocm`／`vitisai`→AMD、`openvino`→Intel、`directml`→任何顯示卡。設定程式據此在「硬體加速」的選項旁標出偵測到的裝置，沒有裝置或推論元件不支援的選項不能選（目前選著的除外），`0c-update status` 也列出偵測結果。偵測只代表「應該能用」，驅動或 plugin 有問題時仍可能開不起來，實際使用的裝置看 `*_accel`。
 
 在 Core Ultra 200V（Arc 140V，`openvino`）量測，往返延遲：
 
@@ -60,6 +67,7 @@ NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的
 | `gpu` | NVIDIA | `python-onnxruntime-cuda`（依賴帶進 `cuda`、`cudnn`）、`nvidia` 或 `nvidia-open` 驅動 | — |
 | `gpu` | AMD | `python-onnxruntime-rocm`（依賴帶進 ROCm 執行階段）；顯示卡要在 ROCm 支援清單內 | 使用者在 `render`、`video` 群組 |
 | `npu` | Intel NPU（Core Ultra） | `python-onnxruntime-openvino`、`openvino-intel-npu-plugin`、`intel-npu-driver`、`level-zero-loader` | 使用者打得開 `/dev/accel/accel*`（見下） |
+| `npu` | AMD NPU（Ryzen AI，實驗性） | 核心的 `amdxdna` 驅動與 AMD 的 Ryzen AI Software（XRT、VitisAI EP；Arch 沒有套件） | 以 Ryzen AI Software 的 Python 當 worker 的 Python |
 
 `intel-npu-driver` 的 udev 規則（`10-intel-npu.rules`）把 `/dev/accel/accel*` 設成 `root:render 0660`，systemd 預設的 `50-udev-default.rules` 再設回 `0666`；剛裝好驅動時可能停在 0660，`sudo udevadm trigger --subsystem-match=accel --action=add` 或重新開機後恢復，或把使用者加進 `render` 群組（重新登入生效）。
 
@@ -72,6 +80,7 @@ NPU 在這台的優點是不占 CPU、較省電，不是比較快：請求小的
 | `gpu` | 任何 DirectX 12 顯示卡（NVIDIA、AMD、Intel） | `numpy onnxruntime-directml` | 顯示卡驅動（DirectML 隨套件附） |
 | `gpu` | NVIDIA（CUDA） | `numpy onnxruntime-gpu` | NVIDIA 驅動，以及 onnxruntime 版本要求的 CUDA 12 與 cuDNN 9 |
 | `gpu`、`npu` | Intel 內顯、Intel NPU | `numpy onnxruntime-openvino==1.24.1 openvino` | Intel 顯示驅動；NPU 另要 Intel NPU 驅動 |
+| `npu` | AMD NPU（Ryzen AI，實驗性） | 不是 pip 套件：安裝 AMD 的 Ryzen AI Software，用它建立的 Python 環境 | AMD NPU 驅動（隨 Ryzen AI Software）；完整版才能編譯 BF16 |
 
 `onnxruntime-openvino` 在 Windows 需要 `openvino` 套件的 DLL，worker 會自己把 `openvino\libs` 加進 DLL 搜尋路徑。這些套件互相取代，一個 Python 環境只裝一種。
 

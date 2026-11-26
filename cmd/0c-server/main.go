@@ -69,7 +69,7 @@ func serve() string {
 	neuralWorker := flag.String("neural-worker", "", "worker 腳本路徑（encoder_runtime.py 或 sequence_runtime.py）")
 	neuralTimeout := flag.Duration("neural-timeout", 100*time.Millisecond, "模型決策期限，上限 100ms；逾時保留原排序")
 	neuralThreads := flag.Int("neural-threads", neural.DefaultThreads(), "模型 CPU threads（1–8，預設為 CPU 邏輯核心數，最多 8）")
-	neuralAccel := flag.String("neural-accel", settings.AccelCPU, "神經選字與補標點的硬體加速：cpu、gpu（顯示卡：CUDA、MIGraphX、ROCm、DirectML 或 OpenVINO，依安裝的 onnxruntime）或 npu（Intel NPU）；無法使用時照舊走 CPU；未指定時依 settings.json 的「硬體加速」")
+	neuralAccel := flag.String("neural-accel", settings.AccelCPU, "神經選字與補標點的硬體加速：cpu、gpu（顯示卡：CUDA、MIGraphX、ROCm、DirectML 或 OpenVINO，依安裝的 onnxruntime）或 npu（Intel 的 OpenVINO、AMD 的 VitisAI）；無法使用時照舊走 CPU；未指定時依 settings.json 的「硬體加速」")
 	punctPackage := flag.String("punct-package", "", "提交時補標點 ONNX 包；未指定時依 settings.json 使用資料包旁內附的 neural/punct")
 	punctWorker := flag.String("punct-worker", "", "補標點 worker 腳本路徑（punct_runtime.py）；Python 同 -neural-python")
 	punctTimeout := flag.Duration("punct-timeout", 150*time.Millisecond, "補標點期限，上限 500ms；逾時照原文提交")
@@ -318,6 +318,22 @@ func serve() string {
 			lg.Printf("神經選字已啟用（背景載入模型）：%s（%d threads，%s）", filepath.Base(*neuralPackage), *neuralThreads, *neuralAccel)
 		}
 	}
+	// 硬體加速偵測（設定程式據此標出這台能用哪些「硬體加速」選項）：用選字 worker 的 Python 與腳本跑一次 --probe，
+	// 不載入模型、在背景進行，結果放進 health 的 accel_*。沒有選字 worker（只用統計引擎、沒有模型）時不偵測。
+	var accelProbe atomic.Pointer[map[string]string]
+	if *neuralWorker != "" && *neuralPython != "" && settings.NeuralAccelSetting(runtime.GOOS) {
+		python, script := *neuralPython, *neuralWorker
+		go func() {
+			info, err := neural.Probe(python, script)
+			if err != nil {
+				lg.Printf("硬體加速偵測失敗：%v", err)
+				info = map[string]string{"accel_probe": "failed"}
+			} else {
+				info["accel_probe"] = "ok"
+			}
+			accelProbe.Store(&info)
+		}()
+	}
 	if *punctPackage != "" {
 		pw, punctErr := neural.OpenPunct(neural.PunctConfig{Python: *neuralPython, Script: *punctWorker, Package: *punctPackage,
 			Threads: *punctThreads, Timeout: *punctTimeout, Accel: *neuralAccel})
@@ -516,6 +532,7 @@ func serve() string {
 	}
 	// 舊欄位保留啟動配置語意；另提供當下可用性，避免背景啟動失敗仍被視為模型已就緒。
 	srv.RuntimeInfo = func() map[string]string {
+		probed := accelProbe.Load()
 		selectionState := neuralState
 		if selectionWorker != nil {
 			selectionState = selectionWorker.State()
@@ -558,6 +575,11 @@ func serve() string {
 			}
 			if provider := punctuationWorker.Provider(); provider != "" {
 				info["punctuation_accel_provider"] = provider
+			}
+		}
+		if probed != nil {
+			for k, v := range *probed {
+				info[k] = v
 			}
 		}
 		if selectionState == "fallback" && selectionWorker != nil && selectionWorker.Reason() != "" {

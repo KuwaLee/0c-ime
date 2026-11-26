@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 
 	"github.com/0c-biggo/0c-ime/internal/autoupdate"
 )
@@ -25,7 +26,10 @@ func modelStatus(dial autoupdate.Dialer) map[string]any {
 		}
 		state[key] = value
 	}
-	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel", "punctuation_accel", "selection_accel_provider", "punctuation_accel_provider"} {
+	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel", "punctuation_accel", "selection_accel_provider", "punctuation_accel_provider",
+		// 硬體加速偵測（neural.Probe）：設定程式據此標出這台能用哪些「硬體加速」選項。
+		"accel_probe", "accel_gpu", "accel_gpu_devices", "accel_gpu_vendors", "accel_gpu_providers",
+		"accel_npu", "accel_npu_devices", "accel_npu_vendors", "accel_npu_providers"} {
 		if info[key] != "" {
 			state[key] = info[key]
 		}
@@ -49,6 +53,9 @@ func printModelStatus(w io.Writer, state map[string]any) {
 		fmt.Fprintf(w, "模型運作狀態（引擎 %s）：\n神經選字：%s\n補標點：%s\n",
 			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"])+accelLabel(state["selection_accel"], state["selection_accel_provider"]),
 			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"])+accelLabel(state["punctuation_accel"], state["punctuation_accel_provider"]))
+		if line := probeLine(state); line != "" {
+			fmt.Fprintln(w, line)
+		}
 	}
 }
 
@@ -116,10 +123,41 @@ func accelLabel(value, provider any) string {
 		}
 		return "（GPU 加速，" + name + "）"
 	case "npu":
-		return "（NPU 加速，Intel OpenVINO）"
+		if name == "" {
+			return "（NPU 加速）"
+		}
+		return "（NPU 加速，" + name + "）"
 	}
 	return ""
 }
 
 // providerNames 是 provider 代碼的顯示名稱（與設定程式的 ACCEL_PROVIDER 相同）。
-var providerNames = map[string]string{"cuda": "NVIDIA CUDA", "migraphx": "AMD MIGraphX", "rocm": "AMD ROCm", "directml": "DirectML", "openvino": "Intel OpenVINO"}
+var providerNames = map[string]string{"cuda": "NVIDIA CUDA", "migraphx": "AMD MIGraphX", "rocm": "AMD ROCm", "directml": "DirectML", "openvino": "Intel OpenVINO", "vitisai": "AMD Ryzen AI"}
+
+// probeLine 列出硬體加速偵測的結果（health 的 accel_*）；引擎沒有偵測（舊版、沒有選字 worker）時為空字串。
+func probeLine(state map[string]any) string {
+	if state["accel_probe"] == "failed" {
+		return "硬體加速偵測：無法偵測"
+	}
+	if state["accel_probe"] != "ok" {
+		return ""
+	}
+	part := func(kind, label string) string {
+		devices, _ := state["accel_"+kind+"_devices"].(string)
+		providers, _ := state["accel_"+kind+"_providers"].(string)
+		switch state["accel_"+kind] {
+		case "available":
+			names := []string{}
+			for _, p := range strings.Split(providers, ",") {
+				if n := providerNames[p]; n != "" {
+					names = append(names, n)
+				}
+			}
+			return label + " 可用（" + devices + "；" + strings.Join(names, "、") + "）"
+		case "no_runtime":
+			return label + " 有裝置（" + devices + "），推論元件不支援"
+		}
+		return label + " 未偵測到"
+	}
+	return "硬體加速偵測：" + part("gpu", "GPU") + "；" + part("npu", "NPU")
+}

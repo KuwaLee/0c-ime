@@ -191,27 +191,91 @@ def unpad_scores(raw, inputs):
     return raw[:k * n].reshape(k, n).sum(1)
 
 
+# NPU 的 provider，依序試（Runtime 只在 onnxruntime 有這個 provider 時才試）：
+# - openvino（Intel NPU）：一個 session 收動態形狀，每個新形狀在第一次執行時編譯；關掉 CPU 退路（編譯失敗時
+#   OpenVINO 預設靜默改用自己的 CPU，比 onnxruntime 的 CPU 慢），失敗才丟例外。
+# - vitisai（AMD Ryzen AI，實驗性，未在 AMD 硬體上驗證）：NPU 編譯器要固定形狀，所以每個形狀各開一個 session，
+#   以 free dimension override 把 L、u、k、n 固定；它本來就把 NPU 不支援的運算交給 CPU，不關 CPU 退路。
+#   編譯結果放在 cache_dir（依模型雜湊分開）；部署版的 VitisAI EP 不能現場編譯 BF16，要裝完整的 Ryzen AI Software，
+#   設定檔由 ZC_VITISAI_CONFIG 或 RYZEN_AI_INSTALLATION_PATH 底下的 vaip_config.json 提供。
+NPU_PROVIDERS = (
+    ('openvino', 'OpenVINOExecutionProvider'),
+    ('vitisai', 'VitisAIExecutionProvider'),
+)
+
+
+def accel_cache_dir(name):
+    """加速裝置的編譯快取：Windows 在 %LOCALAPPDATA%\\Zuin\\cache，其他在 $XDG_CACHE_HOME/0c（或 ~/.cache/0c）。"""
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'Zuin' / 'cache'
+    else:
+        base = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / '0c'
+    path = base / name
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def vitisai_config():
+    """VitisAI 的編譯設定檔：ZC_VITISAI_CONFIG，或 Ryzen AI Software 安裝目錄裡的 vaip_config.json；沒有時為 None。"""
+    explicit = os.environ.get('ZC_VITISAI_CONFIG')
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    root = os.environ.get('RYZEN_AI_INSTALLATION_PATH')
+    if root and os.path.isdir(root):
+        found = sorted(Path(root).rglob('vaip_config.json'))
+        if found:
+            return str(found[0])
+    return None
+
+
 class NPU:
-    """OpenVINO NPU session 與背景編譯。
+    """NPU session 與背景編譯（Intel 走 OpenVINO、AMD 走 VitisAI，見 NPU_PROVIDERS）。
 
     只有編譯過的形狀才走 NPU；沒編譯過的這一次照舊用 CPU，請求永遠不等編譯。形狀由 warm() 排進背景執行緒編譯。
     session 一次只給一個執行緒用（lock）；背景編譯占著時前景改用 CPU。
     某個形狀編譯失敗只停用那個形狀；已編譯的形狀執行出錯則停用 NPU，之後全部走 CPU。
     """
 
-    def __init__(self, ort, path):
-        options = ort.SessionOptions()
-        # OpenVINO EP 在 NPU 編譯失敗時預設靜默改用 OpenVINO 的 CPU（比 onnxruntime 的 CPU 慢），get_providers() 也看不出來；
-        # 關掉這個退路，失敗才會丟例外，由這裡改用 onnxruntime 的 CPU session。
-        options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
-        session = ort.InferenceSession(path, sess_options=options, providers=[('OpenVINOExecutionProvider', {'device_type': 'NPU'})])
-        # onnxruntime 建不起 OpenVINO EP（缺套件、沒有 NPU、沒有裝置權限）時只印警告並退回 CPU。
-        if session.get_providers()[0] != 'OpenVINOExecutionProvider':
-            raise RuntimeError('openvino_npu_unavailable')
-        self.session, self.lock = session, threading.Lock()
+    def __init__(self, ort, path, model_sha):
+        self.ort, self.path, self.model_sha = ort, path, model_sha
+        available = set(ort.get_available_providers())
+        errors = []
+        for name, provider in NPU_PROVIDERS:
+            if provider not in available:
+                continue
+            try:
+                self.name, self.provider = name, provider
+                # openvino：一個動態形狀的 session 先建好；vitisai：每個形狀在背景編譯時各建一個。
+                self.shared = self._session(None) if name == 'openvino' else None
+                break
+            except Exception as e:   # noqa: BLE001 — 試下一個
+                errors.append(f'{name}: {str(e).splitlines()[0][:120]}')
+        else:
+            raise RuntimeError('no_npu_provider' + (' (' + '; '.join(errors) + ')' if errors else ''))
+        self.sessions, self.lock = {}, threading.Lock()
         self.ready, self.pending, self.unsupported, self.failed = set(), set(), set(), False
         self.jobs = queue.Queue()
         threading.Thread(target=self._compile_loop, daemon=True).start()
+
+    def _session(self, shape):
+        options = self.ort.SessionOptions()
+        if self.name == 'openvino':
+            add_openvino_dll_dir()
+            options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+            provider_options = {'device_type': 'NPU'}
+        else:
+            length, proj_len = shape
+            for dim, value in (('L', length), ('u', proj_len), ('k', NPU_ROWS), ('n', 1)):
+                options.add_free_dimension_override_by_name(dim, value)
+            provider_options = {'cache_dir': accel_cache_dir('vitisai'), 'cache_key': f'zc-{self.model_sha[:16]}-{length}x{proj_len}'}
+            config = vitisai_config()
+            if config:
+                provider_options['config_file'] = config
+        session = self.ort.InferenceSession(self.path, sess_options=options, providers=[(self.provider, provider_options)])
+        # provider 建不起來（缺套件、沒有 NPU、沒有裝置權限）時 onnxruntime 只印警告並退回 CPU。
+        if session.get_providers()[0] != self.provider:
+            raise RuntimeError(f'{self.name}_npu_unavailable')
+        return session
 
     def warm(self, inputs, shape):
         """背景編譯這個形狀（把呼叫端給的樣本補齊；樣本只用字表，不含使用者文字）。"""
@@ -224,21 +288,23 @@ class NPU:
         while True:
             shape, padded = self.jobs.get()
             try:
+                session = self.shared or self._session(shape)
                 with self.lock:
-                    raw = self.session.run(['scores'], padded)[0]
+                    raw = session.run(['scores'], padded)[0]
                 if not np.isfinite(raw).all():
                     raise ValueError('nonfinite_neural_score')
+                self.sessions[shape] = session
                 self.ready.add(shape)
             except Exception as e:   # noqa: BLE001 — 只停用這個形狀，CPU 照常
                 self.unsupported.add(shape)
-                print(f'npu cannot compile shape {shape}, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
+                print(f'npu ({self.name}) cannot compile shape {shape}, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
             finally:
                 self.pending.discard(shape)
 
     def disable(self, error):
         if not self.failed:
             self.failed = True
-            print(f'npu disabled, using cpu: {error}', file=sys.stderr, flush=True)
+            print(f'npu ({self.name}) disabled, using cpu: {error}', file=sys.stderr, flush=True)
 
     def run(self, inputs):
         """編譯過且 session 空著時回傳分數，否則回 None 讓呼叫端用 CPU。"""
@@ -248,7 +314,7 @@ class NPU:
         if shape not in self.ready or not self.lock.acquire(blocking=False):
             return None
         try:
-            raw = self.session.run(['scores'], pad_for_npu(inputs, shape))[0]
+            raw = self.sessions[shape].run(['scores'], pad_for_npu(inputs, shape))[0]
         except Exception as e:   # noqa: BLE001
             self.disable(e)
             return None
@@ -398,8 +464,7 @@ class Runtime:
         if accel != 'cpu':
             try:
                 if accel == 'npu':
-                    add_openvino_dll_dir()
-                    self.accel = NPU(ort, str(package / 'model.onnx'))
+                    self.accel = NPU(ort, str(package / 'model.onnx'), m['files']['model.onnx'])
                 else:
                     self.accel = Offload(*open_gpu(ort, str(package / 'model.onnx')), 'scores', GPU_BUDGET)
             except Exception as e:   # noqa: BLE001 — 裝置無法使用時照舊只用 CPU
@@ -442,14 +507,136 @@ class Runtime:
         return raw.reshape(-1, count).max(0).tolist()   # 各讀音分支逐候選取最大
 
 
+# ---- 硬體加速偵測（--probe）：設定程式據此標出這台能用哪些選項 ----
+# 只看兩件事：作業系統列出的裝置（Linux 的 /sys、Windows 登錄的 Display 與 ComputeAccelerator 裝置類別），以及已安裝的
+# onnxruntime 有哪些 provider。「可用」不保證開得起來（驅動、plugin 有問題時仍會失敗），實際使用的裝置看就緒訊息的 accel。
+PCI_VENDORS = {'0x10de': 'nvidia', '0x1002': 'amd', '0x1022': 'amd', '0x8086': 'intel', '0x5143': 'qualcomm'}
+# provider 能用在哪些廠牌的裝置上（directml 是 Windows 上任何 DirectX 12 顯示卡）。
+PROVIDER_VENDORS = {'cuda': {'nvidia'}, 'migraphx': {'amd'}, 'rocm': {'amd'}, 'directml': None, 'openvino': {'intel'},
+                    'vitisai': {'amd'}}
+NPU_DRIVERS = {'intel_vpu': ('intel', 'Intel NPU'), 'amdxdna': ('amd', 'AMD NPU')}
+VENDOR_NAMES = {'nvidia': 'NVIDIA', 'amd': 'AMD', 'intel': 'Intel', 'qualcomm': 'Qualcomm'}
+
+
+def vendor_of(text):
+    t = text.lower()
+    for key, vendor in (('nvidia', 'nvidia'), ('advanced micro', 'amd'), ('amd', 'amd'), ('radeon', 'amd'),
+                        ('intel', 'intel'), ('qualcomm', 'qualcomm')):
+        if key in t:
+            return vendor
+    return 'other'
+
+
+def _read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ''
+
+
+def linux_devices(sys_root='/sys'):
+    """PCI 顯示控制器（class 0x03xxxx）與已載入驅動的 NPU（/sys/class/accel）。"""
+    gpus, npus = [], []
+    pci = Path(sys_root, 'bus', 'pci', 'devices')
+    for dev in sorted(pci.iterdir()) if pci.is_dir() else []:
+        if _read(dev / 'class').startswith('0x03'):
+            vendor = PCI_VENDORS.get(_read(dev / 'vendor'), 'other')
+            driver = os.path.basename(os.readlink(dev / 'driver')) if (dev / 'driver').is_symlink() else ''
+            gpus.append({'vendor': vendor, 'name': f'{VENDOR_NAMES.get(vendor, "Other")} GPU' + (f' ({driver})' if driver else '')})
+    accel = Path(sys_root, 'class', 'accel')
+    for node in sorted(accel.iterdir()) if accel.is_dir() else []:
+        dev = node / 'device'
+        driver = os.path.basename(os.readlink(dev / 'driver')) if (dev / 'driver').is_symlink() else ''
+        vendor, name = NPU_DRIVERS.get(driver, (PCI_VENDORS.get(_read(dev / 'vendor'), 'other'), 'NPU'))
+        npus.append({'vendor': vendor, 'name': name})
+    return gpus, npus
+
+
+def windows_devices():
+    """登錄的裝置類別 Display（顯示卡）與 ComputeAccelerator（Windows「神經處理器」，NPU）底下已安裝驅動的裝置。"""
+    import winreg
+    gpus, npus = [], []
+    root = r'SYSTEM\CurrentControlSet\Control\Class'
+
+    def subkeys(key):
+        i = 0
+        while True:
+            try:
+                yield winreg.EnumKey(key, i)
+            except OSError:
+                return
+            i += 1
+
+    def value(key, name):
+        try:
+            return str(winreg.QueryValueEx(key, name)[0])
+        except OSError:
+            return ''
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root) as classes:
+        for guid in subkeys(classes):
+            try:
+                with winreg.OpenKey(classes, guid) as cls:
+                    kind = value(cls, 'Class')
+                    if kind not in ('Display', 'ComputeAccelerator'):
+                        continue
+                    for sub in subkeys(cls):
+                        if not sub.isdigit():
+                            continue
+                        try:
+                            with winreg.OpenKey(cls, sub) as dev:
+                                name, provider = value(dev, 'DriverDesc'), value(dev, 'ProviderName')
+                        except OSError:
+                            continue
+                        if not name or (kind == 'Display' and provider.lower().startswith('microsoft')):
+                            continue   # 基本顯示卡、遠端桌面等 Microsoft 的虛擬顯示卡不算
+                        (gpus if kind == 'Display' else npus).append({'vendor': vendor_of(provider + ' ' + name), 'name': name})
+            except OSError:
+                continue
+    return gpus, npus
+
+
+def probe(sys_root='/sys'):
+    """回報這台的 GPU／NPU 與 onnxruntime 的 provider，以及設定的 gpu、npu 各自能不能用。"""
+    out = {'probe': 1}
+    try:
+        import onnxruntime as ort
+        providers = list(ort.get_available_providers())
+        out['onnxruntime'] = ort.__version__
+    except Exception as e:   # noqa: BLE001 — 沒有 onnxruntime 時裝置照樣列出
+        providers = []
+        out['onnxruntime_error'] = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+    out['providers'] = providers
+    try:
+        gpus, npus = windows_devices() if sys.platform == 'win32' else linux_devices(sys_root)
+    except Exception as e:   # noqa: BLE001
+        gpus, npus = [], []
+        out['devices_error'] = str(e)[:200]
+    for kind, devices, table in (('gpu', gpus, GPU_PROVIDERS), ('npu', npus, NPU_PROVIDERS)):
+        vendors = {d['vendor'] for d in devices}
+        usable = [entry[0] for entry in table if entry[1] in providers
+                  and (PROVIDER_VENDORS[entry[0]] is None or PROVIDER_VENDORS[entry[0]] & vendors)]
+        status = 'available' if usable and devices else 'no_device' if not devices else 'no_runtime'
+        out[kind] = {'status': status, 'devices': devices, 'providers': usable}
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--package', type=Path, required=True); p.add_argument('--dictionary', required=True)
+    p.add_argument('--package', type=Path); p.add_argument('--dictionary')
     p.add_argument('--threads', type=int, default=2)
     p.add_argument('--accel', choices=ACCELS, default='cpu',
                    help='gpu：第一個可用的 GPU provider（CUDA、MIGraphX、ROCm、DirectML、OpenVINO，FP32）；'
-                        'npu：已編譯形狀走 OpenVINO Intel NPU；裝置無法使用時走 CPU')
+                        'npu：已編譯形狀走 NPU（OpenVINO 的 Intel NPU、VitisAI 的 AMD NPU）；裝置無法使用時走 CPU；'
+                        '--probe 只偵測裝置')
+    p.add_argument('--probe', action='store_true', help='只回報這台的 GPU／NPU 與可用的 provider（JSON 一行）後結束，不載入模型')
+    p.add_argument('--probe-sys-root', default='/sys', help=argparse.SUPPRESS)   # 測試用的假 /sys
     a = p.parse_args()
+    if a.probe:
+        print(json.dumps(probe(a.probe_sys_root), ensure_ascii=False), flush=True)
+        return
+    if a.package is None or a.dictionary is None:
+        p.error('--package and --dictionary are required')
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')
     runtime = Runtime(a.package, a.dictionary, a.threads, a.accel)
@@ -473,7 +660,7 @@ def main():
     # selection_accel_provider）。
     ready['accel'] = 'npu' if isinstance(runtime.accel, NPU) else 'gpu' if isinstance(runtime.accel, Offload) else 'cpu'
     if runtime.accel is not None:
-        ready['accel_provider'] = 'openvino' if isinstance(runtime.accel, NPU) else runtime.accel.name
+        ready['accel_provider'] = runtime.accel.name
     print(json.dumps(ready), flush=True)
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 1)

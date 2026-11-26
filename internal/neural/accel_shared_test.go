@@ -28,13 +28,26 @@ func TestAccelSharedBlockIdentical(t *testing.T) {
 	if seq != punct {
 		t.Fatal("sequence_runtime.py 與 punct_runtime.py 的 accel-shared 區塊不同")
 	}
-	// Go 端認得的 provider 要與 worker 的 GPU_PROVIDERS 一致（openvino 另外也是 NPU 的 provider）。
+	// Go 端認得的 provider 要與 worker 一致：GPU_PROVIDERS 依序，再加上 NPU_PROVIDERS 裡 GPU 沒有的（vitisai）。
+	re := regexp.MustCompile(`\('([a-z]+)', '[A-Za-z]+ExecutionProvider'`)
 	var names []string
-	for _, m := range regexp.MustCompile(`\('([a-z]+)', '[A-Za-z]+ExecutionProvider'`).FindAllStringSubmatch(seq, -1) {
+	for _, m := range re.FindAllStringSubmatch(seq, -1) {
 		names = append(names, m[1])
 	}
+	whole, err := os.ReadFile(filepath.Join("..", "..", "platforms", "neural", "runtime", "sequence_runtime.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	npu := string(whole)
+	npu = npu[strings.Index(npu, "NPU_PROVIDERS = ("):]
+	npu = npu[:strings.Index(npu, "\n)\n")]
+	for _, m := range re.FindAllStringSubmatch(npu, -1) {
+		if !slices.Contains(names, m[1]) {
+			names = append(names, m[1])
+		}
+	}
 	if !slices.Equal(names, Providers) {
-		t.Fatalf("GPU_PROVIDERS %v 與 Providers %v 不同", names, Providers)
+		t.Fatalf("worker 的 provider %v 與 Providers %v 不同", names, Providers)
 	}
 	if !strings.Contains(seq, "'use_tf32': '0'") {
 		t.Fatal("CUDA 要關掉 TF32，結果才與 CPU 的 FP32 相同")
