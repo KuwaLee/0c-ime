@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -365,5 +366,37 @@ func TestStartupStderrStopsAfterReady(t *testing.T) {
 	// 就緒後的 traceback 可能含使用者文字，不能留下。
 	if n, err := s.Write([]byte("使用者文字")); err != nil || n != len("使用者文字") || len(s.buf) != 0 {
 		t.Fatalf("stderr kept after ready: %d %v %q", n, err, s.buf)
+	}
+}
+
+func TestWorkerAccelArgs(t *testing.T) {
+	base := Config{Package: "pkg", DictionarySHA256: "d", Threads: 2}
+	want := []string{"--package", "pkg", "--dictionary", "d", "--threads", "2"}
+	for _, accel := range []string{"", AccelCPU} {
+		c := base
+		c.Accel = accel
+		if got := workerArgs(c); !slices.Equal(got, want) {
+			t.Fatalf("accel %q: %v，CPU 的命令列須與以前相同", accel, got)
+		}
+	}
+	c := base
+	for _, accel := range []string{AccelNPU, AccelGPU} {
+		c.Accel = accel
+		if got := workerArgs(c); !slices.Equal(got, append(slices.Clone(want), "--accel", accel)) {
+			t.Fatalf("%s: %v", accel, got)
+		}
+	}
+	c.Accel, c.Timeout = "vulkan", 50*time.Millisecond
+	if _, err := loadManifest(c); err == nil || !strings.Contains(err.Error(), "accel") {
+		t.Fatalf("unknown accel accepted: %v", err)
+	}
+}
+
+// 舊 worker 的就緒訊息沒有 accel、或不認得的值，一律當作 CPU。
+func TestReadyAccel(t *testing.T) {
+	for in, want := range map[string]string{"": AccelCPU, "cpu": AccelCPU, "gpu": AccelGPU, "npu": AccelNPU, "tpu": AccelCPU} {
+		if got := readyAccel(in); got != want {
+			t.Fatalf("readyAccel(%q)=%q，要 %q", in, got, want)
+		}
 	}
 }

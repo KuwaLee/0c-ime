@@ -19,6 +19,24 @@ build/0c-server -data assets/data \
 
 系統 Python 須已安裝 numpy 與 onnxruntime；server 依使用者設定啟動模型。補標點仍預設關閉。安裝時依發行版目錄配置調整上述路徑，並保留字典與模型的固定配對。
 
+### Intel GPU／NPU（選用）
+
+設定的「硬體加速」（`neural-accel`，`settings.json` 的 `neural_accel`：`cpu`、`gpu`、`npu`，只有 Windows、Linux）讓選字 worker 改用 OpenVINO 的 Intel GPU 或 NPU（worker 參數 `--accel`）；預設 `cpu` 與以前相同，裝置無法使用時也照舊走 CPU，就緒訊息的 `accel` 回報實際使用的裝置（health 的 `selection_accel`，設定程式據此說明）。`0c-server -neural-accel` 可蓋過設定。補標點 worker 不受影響。兩者都需要 onnxruntime 含 OpenVINO EP（Arch：`python-onnxruntime-openvino`）；官網安裝包內附的 onnxruntime 只有 CPU，選 GPU、NPU 時照舊用 CPU。
+
+在 Core Ultra 200V（Arc 140V）以逐鍵輸入的 3,472 個請求（前文 64 字）量測，往返延遲：
+
+| 裝置 | 平均 | p99 | 首選與 CPU 相同 |
+|---|---:|---:|---:|
+| `cpu`（8 threads） | 11.2 ms | 19.0 ms | — |
+| `gpu` | 4.6 ms | 6.6 ms | 100% |
+| `npu` | 約 6.7 ms | 約 19 ms | 99.8% |
+
+**GPU**（建議）需要 OpenVINO 的 GPU plugin 與 Intel 的 OpenCL 驅動（Arch：`openvino-intel-gpu-plugin`、`intel-compute-runtime`）。以 FP32 計算、收動態形狀，不必補齊；新形狀第一次約數十 ms。FP16 不能用：遮罩以 float32 最小值相加，fp16 溢位成 inf／NaN。
+
+**NPU** 需要 OpenVINO 的 NPU plugin（`openvino-intel-npu-plugin`）與 NPU 使用者空間驅動（`intel-npu-driver`、`level-zero-loader`），且使用者打得開 `/dev/accel/accel*`。
+
+NPU 只吃固定形狀，worker 把輸入補齊到 6 個形狀（L 128／256 × proj_pos 8／16／24，target 256 列），就緒後在背景編譯；編譯好之前、超出這些形狀（逐鍵輸入約 22%，主要是 proj_pos 超過 24）、或 NPU 無法使用時，照舊用 CPU session，請求不等編譯。NPU 以 fp16 計算，模型分數與 CPU 略有差異（逐鍵請求的首選 99.8% 相同）。編譯結果快取在 `~/.cache/ze_intel_npu_cache`。
+
 ## 官網可攜套件
 
 ```sh

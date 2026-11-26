@@ -25,7 +25,7 @@ func modelStatus(dial autoupdate.Dialer) map[string]any {
 		}
 		state[key] = value
 	}
-	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source"} {
+	for _, key := range []string{"selection_reason", "punctuation_reason", "selection_source", "punctuation_source", "selection_accel"} {
 		if info[key] != "" {
 			state[key] = info[key]
 		}
@@ -47,7 +47,7 @@ func printModelStatus(w io.Writer, state map[string]any) {
 		fmt.Fprintln(w, "暫時無法查詢模型運作狀態。")
 	default:
 		fmt.Fprintf(w, "模型運作狀態（引擎 %s）：\n神經選字：%s\n補標點：%s\n",
-			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"]),
+			state["version"], modelStateLabel(state["selection_state"], "統計引擎")+reasonLabel(state["selection_reason"])+sourceLabel(state["selection_source"])+accelLabel(state["selection_accel"]),
 			modelStateLabel(state["punctuation_state"], "原文提交")+reasonLabel(state["punctuation_reason"])+sourceLabel(state["punctuation_source"]))
 	}
 }
@@ -102,6 +102,17 @@ func reasonLabel(value any) string {
 		return "（模型載入逾時）"
 	case "failed":
 		return "（模型程式無法啟動）"
+	}
+	return ""
+}
+
+// accelLabel 說明神經選字實際使用的硬體加速（health 的 selection_accel）；CPU 或舊引擎沒有回報時不加字。
+func accelLabel(value any) string {
+	switch value {
+	case "gpu":
+		return "（Intel 內顯加速）"
+	case "npu":
+		return "（Intel NPU 加速）"
 	}
 	return ""
 }

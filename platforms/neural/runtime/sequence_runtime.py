@@ -17,7 +17,9 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import sys
+import threading
 
 import numpy as np
 
@@ -34,6 +36,18 @@ CONTEXT_POLICY = 'confirmed_left_64'
 TONES = {'ˊ': 2, 'ˇ': 3, 'ˋ': 4, '˙': 5}
 TONE_POLICY_SCHEMA = 'zuin-tone-mask-v1'
 MAX_CANDIDATES = 16   # 同 ime rerank.MaxCandidates：打出讀音 8 個＋輕聲擴充最多 8 個
+ACCELS = ('cpu', 'npu', 'gpu')
+# NPU（OpenVINO）每遇到新的輸入形狀就要編譯一次（冷 ~1 s，驅動磁碟快取 ~0.2 s），遠超過宿主的時限，
+# 所以 NPU 只收補齊後的固定形狀：L 補到 NPU_LENGTHS、proj_pos 補到 NPU_PROJ、target 攤平成單欄後補到 NPU_ROWS 列，
+# 共 6 個形狀，啟動後在背景全部編譯。超出的請求走 CPU。
+# 補齊不改變分數：補的 token 只注意自己、真實 token 看不到它們；proj_pos 與 target 多的列重複第 0 項，輸出再截掉；
+# 候選分數是各字 log 機率的總和，攤平成單欄後在這裡加總，等於原本的 [k, n] 輸出。
+# proj_pos 上限 24：每個位置要對整個字表（約 2.8 萬字）做 log_softmax，Core Ultra 200V 的 NPU 片上記憶體（CMX）
+# 放不下 32 個位置，編譯失敗。逐鍵輸入的請求（前文 64 字）約 78% 在 24 以內，L 全部在 256 以內、列數 99.9% 在 256 以內。
+NPU_LENGTHS = (128, 256)
+NPU_PROJ = (8, 16, 24)
+NPU_ROWS = 256
+NPU_SHAPES = tuple((L, u) for L in NPU_LENGTHS for u in NPU_PROJ)
 
 
 def sha(path):
@@ -144,8 +158,157 @@ def prepare(context, reading, candidates, maps, allow_partial=False, text_only=F
             'mask': mask[None, None], 'proj_pos': np.array(proj, dtype=np.int64), 'target_node': target_node, 'target_ids': target_ids}
 
 
+def npu_shape(inputs):
+    """回傳這次輸入補齊後的 (L, proj_pos 長度)；超出 NPU 形狀範圍時回 None（改用 CPU）。"""
+    L, u = inputs['ids'].shape[1], inputs['proj_pos'].shape[0]
+    if inputs['target_node'].size > NPU_ROWS:
+        return None
+    return next(((b, p) for b, p in NPU_SHAPES if b >= L and p >= u), None)
+
+
+def pad_for_npu(inputs, shape):
+    """把 prepare() 的輸入補到固定形狀 shape=(L, proj_pos 長度)、NPU_ROWS 列；分數由 unpad_scores 還原。"""
+    length, proj_len = shape
+    L = inputs['ids'].shape[1]
+    out = {}
+    for key in ('ids', 'bases', 'tones', 'types', 'positions'):
+        out[key] = np.zeros((1, length), dtype=np.int64); out[key][0, :L] = inputs[key][0]
+    mask = np.zeros((length, length), dtype=bool); mask[:L, :L] = inputs['mask'][0, 0]
+    pad = np.arange(L, length); mask[pad, pad] = True   # 補的 token 只注意自己，避免整列遮掉
+    out['mask'] = mask[None, None]
+    proj = inputs['proj_pos']; out['proj_pos'] = np.concatenate([proj, np.full(proj_len - proj.size, proj[0], dtype=np.int64)])
+    node, ids = inputs['target_node'].reshape(-1, 1), inputs['target_ids'].reshape(-1, 1)
+    extra = NPU_ROWS - node.shape[0]
+    out['target_node'] = np.concatenate([node, np.repeat(node[:1], extra, 0)])
+    out['target_ids'] = np.concatenate([ids, np.repeat(ids[:1], extra, 0)])
+    return out
+
+
+def unpad_scores(raw, inputs):
+    k, n = inputs['target_node'].shape
+    return raw[:k * n].reshape(k, n).sum(1)
+
+
+class NPU:
+    """OpenVINO NPU session 與背景編譯。
+
+    只有編譯過的形狀才走 NPU；沒編譯過的這一次照舊用 CPU，請求永遠不等編譯。形狀由 warm() 排進背景執行緒編譯。
+    session 一次只給一個執行緒用（lock）；背景編譯占著時前景改用 CPU。
+    某個形狀編譯失敗只停用那個形狀；已編譯的形狀執行出錯則停用 NPU，之後全部走 CPU。
+    """
+
+    def __init__(self, ort, path):
+        options = ort.SessionOptions()
+        # OpenVINO EP 在 NPU 編譯失敗時預設靜默改用 OpenVINO 的 CPU（比 onnxruntime 的 CPU 慢），get_providers() 也看不出來；
+        # 關掉這個退路，失敗才會丟例外，由這裡改用 onnxruntime 的 CPU session。
+        options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+        session = ort.InferenceSession(path, sess_options=options, providers=[('OpenVINOExecutionProvider', {'device_type': 'NPU'})])
+        # onnxruntime 建不起 OpenVINO EP（缺套件、沒有 NPU、沒有裝置權限）時只印警告並退回 CPU。
+        if session.get_providers()[0] != 'OpenVINOExecutionProvider':
+            raise RuntimeError('openvino_npu_unavailable')
+        self.session, self.lock = session, threading.Lock()
+        self.ready, self.pending, self.unsupported, self.failed = set(), set(), set(), False
+        self.jobs = queue.Queue()
+        threading.Thread(target=self._compile_loop, daemon=True).start()
+
+    def warm(self, inputs, shape):
+        """背景編譯這個形狀（把呼叫端給的樣本補齊；樣本只用字表，不含使用者文字）。"""
+        if shape in self.ready or shape in self.pending or shape in self.unsupported or self.failed:
+            return
+        self.pending.add(shape)
+        self.jobs.put((shape, pad_for_npu(inputs, shape)))
+
+    def _compile_loop(self):
+        while True:
+            shape, padded = self.jobs.get()
+            try:
+                with self.lock:
+                    raw = self.session.run(['scores'], padded)[0]
+                if not np.isfinite(raw).all():
+                    raise ValueError('nonfinite_neural_score')
+                self.ready.add(shape)
+            except Exception as e:   # noqa: BLE001 — 只停用這個形狀，CPU 照常
+                self.unsupported.add(shape)
+                print(f'npu cannot compile shape {shape}, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
+            finally:
+                self.pending.discard(shape)
+
+    def disable(self, error):
+        if not self.failed:
+            self.failed = True
+            print(f'npu disabled, using cpu: {error}', file=sys.stderr, flush=True)
+
+    def run(self, inputs):
+        """編譯過且 session 空著時回傳分數，否則回 None 讓呼叫端用 CPU。"""
+        if self.failed:
+            return None
+        shape = npu_shape(inputs)
+        if shape not in self.ready or not self.lock.acquire(blocking=False):
+            return None
+        try:
+            raw = self.session.run(['scores'], pad_for_npu(inputs, shape))[0]
+        except Exception as e:   # noqa: BLE001
+            self.disable(e)
+            return None
+        finally:
+            self.lock.release()
+        return unpad_scores(raw, inputs)
+
+
+def add_openvino_dll_dir():
+    """Windows：onnxruntime-openvino 的 provider DLL 依賴 openvino 套件的 DLL（openvino\\libs），不在預設搜尋路徑。
+
+    onnxruntime 附的 tools.add_openvino_win_libs 找不到時會 sys.exit，這裡改成找不到就不做事（建立 session 失敗後照舊用 CPU）。
+    只找套件目錄、不 import openvino。其他平台的 wheel 自己帶 rpath，不必處理。
+    """
+    if sys.platform != 'win32':
+        return
+    import importlib.util
+    spec = importlib.util.find_spec('openvino')
+    for root in (spec.submodule_search_locations or []) if spec else []:
+        libs = os.path.join(root, 'libs')
+        if os.path.isdir(libs):
+            os.add_dll_directory(libs)
+            os.environ['PATH'] = libs + os.pathsep + os.environ.get('PATH', '')
+            return
+
+
+class GPU:
+    """OpenVINO Intel GPU session（FP32）。
+
+    GPU 收動態形狀，不必補齊：新形狀第一次約數十 ms（量測最多 46 ms），之後約 7 ms。FP16 不能用：
+    遮罩以 float32 最小值相加，fp16 溢位成 inf／NaN。執行出錯或分數非有限值時這一次改用 CPU，
+    連續出錯 GPU_MAX_ERRORS 次即停用。
+    """
+    GPU_MAX_ERRORS = 3
+
+    def __init__(self, ort, path):
+        options = ort.SessionOptions()
+        options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
+        session = ort.InferenceSession(path, sess_options=options,
+                                       providers=[('OpenVINOExecutionProvider', {'device_type': 'GPU', 'precision': 'FP32'})])
+        if session.get_providers()[0] != 'OpenVINOExecutionProvider':
+            raise RuntimeError('openvino_gpu_unavailable')
+        self.session, self.errors = session, 0
+
+    def run(self, inputs):
+        if self.errors >= self.GPU_MAX_ERRORS:
+            return None
+        try:
+            raw = self.session.run(['scores'], inputs)[0]
+            if not np.isfinite(raw).all():
+                raise ValueError('nonfinite_neural_score')
+        except Exception as e:   # noqa: BLE001 — 這一次改用 CPU
+            self.errors += 1
+            if self.errors == self.GPU_MAX_ERRORS:
+                print(f'gpu disabled, using cpu: {str(e).splitlines()[0][:200]}', file=sys.stderr, flush=True)
+            return None
+        self.errors = 0
+        return raw
+
+
 class Runtime:
-    def __init__(self, package, dictionary, threads=2):
+    def __init__(self, package, dictionary, threads=2, accel='cpu'):
         import onnxruntime as ort
         if hasattr(ort, 'disable_telemetry_events'):   # 再保險一次：之後的 session 與推論事件也不記
             ort.disable_telemetry_events()
@@ -174,6 +337,13 @@ class Runtime:
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.add_session_config_entry('session.intra_op.allow_spinning', '0')
         self.session = ort.InferenceSession(str(package / 'model.onnx'), sess_options=options, providers=['CPUExecutionProvider'])
+        self.accel = None   # 加速裝置（NPU 或 GPU）；None 時只用 CPU
+        if accel != 'cpu':
+            try:
+                add_openvino_dll_dir()
+                self.accel =(NPU if accel == 'npu' else GPU)(ort, str(package / 'model.onnx'))
+            except Exception as e:   # noqa: BLE001 — 裝置無法使用時照舊只用 CPU
+                print(f'{accel} unavailable, using cpu: {e}', file=sys.stderr, flush=True)
         self.model_sha = m['files']['model.onnx']; self.dictionary = dictionary
         self.allow_partial = bool(m.get('allow_partial', False))
         self.text_mode = float(m.get('text_weight', 0)) > 0
@@ -203,7 +373,10 @@ class Runtime:
         inputs = prepare(request.get('context', ''), reading, request['candidates'], self.maps, self.allow_partial,
                          text_only=mode == 'text', neutral_last=neutral, tone_known=request.get('tone_known'),
                          allow_unknown_tones=self.allow_unknown_tones)
-        raw = self.session.run(['scores'], inputs)[0].astype(float)
+        raw = self.accel.run(inputs) if self.accel else None
+        if raw is None:
+            raw = self.session.run(['scores'], inputs)[0]
+        raw = raw.astype(float)
         if raw.shape[0] % count or not np.isfinite(raw).all():
             raise ValueError('nonfinite_neural_score')
         return raw.reshape(-1, count).max(0).tolist()   # 各讀音分支逐候選取最大
@@ -213,10 +386,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--package', type=Path, required=True); p.add_argument('--dictionary', required=True)
     p.add_argument('--threads', type=int, default=2)
+    p.add_argument('--accel', choices=ACCELS, default='cpu',
+                   help='npu：已編譯形狀走 OpenVINO NPU；gpu：OpenVINO Intel GPU（FP32）；裝置無法使用時走 CPU')
     a = p.parse_args()
     if not 1 <= a.threads <= 8:
         p.error('threads must be between 1 and 8')
-    runtime = Runtime(a.package, a.dictionary, a.threads)
+    runtime = Runtime(a.package, a.dictionary, a.threads, a.accel)
     # 暖機只用字表，不含新聞、私人輸入或評測資料。
     chars = runtime.vocab['characters'][8:12]; base = runtime.vocab['bases'][0]
     seg = lambda t: {'text': t, 'log_score': 0., 'segments': [{'Start': 0, 'End': 2, 'Word': t, 'Partial': False, 'Correction': False}]}
@@ -224,10 +399,17 @@ def main():
             'reading': [base] * 2, 'candidates': [seg(chars[0] + chars[1]), seg(chars[2] + chars[3])],
             'allow_partial': runtime.allow_partial}
     runtime.score(warm)
+    if isinstance(runtime.accel, NPU):
+        # 全部 6 個形狀在背景編譯（同一份字表樣本可補到任何形狀）：冷編譯每個約 1 s，之後有驅動的磁碟快取，約 0.2 s。
+        sample = prepare(warm['context'], warm['reading'], warm['candidates'], runtime.maps, runtime.allow_partial)
+        for shape in NPU_SHAPES:
+            runtime.accel.warm(sample, shape)
     ready = {'ready': True, 'schema': runtime.manifest['schema'], 'model_sha256': runtime.model_sha,
              'dictionary_sha256': a.dictionary, 'allow_partial': runtime.allow_partial}
     if runtime.allow_unknown_tones:
         ready['tone_policy'] = runtime.manifest['tone_policy']
+    # 實際使用的裝置：要求 gpu／npu 但裝置無法使用時是 cpu（宿主的 health 回報 selection_accel）。
+    ready['accel'] = 'npu' if isinstance(runtime.accel, NPU) else 'gpu' if isinstance(runtime.accel, GPU) else 'cpu'
     print(json.dumps(ready), flush=True)
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 1)

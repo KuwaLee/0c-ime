@@ -91,6 +91,18 @@
     }
   }
   // 引擎的 *_reason：模型退回的原因（與 0c-update status 的文字相同）。
+  // 神經選字實際使用的硬體加速（health 的 selection_accel）。要求了 GPU／NPU 卻是 CPU：推論元件或驅動不支援，
+  // worker 已改回 CPU。設定剛改、引擎還沒重新啟動（pending）時不下結論。
+  const ACCEL_LABEL = { gpu: '（Intel 內顯加速）', npu: '（Intel NPU 加速）' };
+  function accelNote(runtime) {
+    if (runtime.selection_state !== 'ready') return '';
+    if (ACCEL_LABEL[runtime.selection_accel]) return ACCEL_LABEL[runtime.selection_accel];
+    const wanted = (state.settings?.items || []).find((item) => item.key === 'neural-accel');
+    if (wanted && !wanted.pending && (wanted.value === 'gpu' || wanted.value === 'npu') && runtime.selection_accel === 'cpu') {
+      return '（硬體加速無法使用，以 CPU 計算）';
+    }
+    return '';
+  }
   const MODEL_REASON = {
     missing_runtime: '（缺少系統元件：Visual C++ 執行階段）', timeout: '（模型載入逾時）', failed: '（模型程式無法啟動）',
   };
@@ -401,7 +413,7 @@
     ];
     if (runtime.state === 'running') {
       rows.push(
-        row(labelBlock('神經選字'), h('div', { class: 'value' }, modelLabel(runtime.selection_state, '統計引擎') + (MODEL_REASON[runtime.selection_reason] || ''), ' ',
+        row(labelBlock('神經選字'), h('div', { class: 'value' }, modelLabel(runtime.selection_state, '統計引擎') + (MODEL_REASON[runtime.selection_reason] || '') + accelNote(runtime), ' ',
           h('button', { type: 'button', class: 'secondary', 'data-focus': 'models-card', onclick: () => show('models') }, '查看'))),
         row(labelBlock('補標點（Beta）'), h('div', { class: 'value' }, modelLabel(runtime.punctuation_state, '原文提交') + (MODEL_REASON[runtime.punctuation_reason] || ''))));
     }
@@ -516,7 +528,8 @@
       title: '選字', lead: '候選字怎麼排、怎麼選，以及要不要列出近音的字（模糊音）。',
       // zhuyin-error-hint（#300，打錯注音時提示）跟不打聲調一樣是按聲調時的規則，接在它後面。
       // personal-learning（#297，記住我選的字詞）是個人偏好，排在選字項目最後、輸入習慣的規則之前。
-      keys: ['selection', 'document-context', 'space-selects', 'candidate-cursor', 'advance-after-select', 'candidate-layout', 'selection-keys', 'esc-clear', 'toneless', 'zhuyin-error-hint', 'personal-learning', 'style-tab', 'style-up', 'style-candidate-tab', 'style-candidate-space', 'style-candidate-enter', 'style-page-size', 'style-candidate-navigation'],
+      // neural-accel（硬體加速）是神經選字怎麼計算，接在選字方式後面；macOS 沒有這一項，引擎不列出就不畫。
+      keys: ['selection', 'neural-accel', 'document-context', 'space-selects', 'candidate-cursor', 'advance-after-select', 'candidate-layout', 'selection-keys', 'esc-clear', 'toneless', 'zhuyin-error-hint', 'personal-learning', 'style-tab', 'style-up', 'style-candidate-tab', 'style-candidate-space', 'style-candidate-enter', 'style-page-size', 'style-candidate-navigation'],
     },
     keyboard: {
       title: '鍵盤與符號', lead: '注音的鍵盤排列，以及標點符號和 Emoji 怎麼打。',

@@ -194,6 +194,16 @@ func (s *Supervisor) State() string {
 	return "fallback"
 }
 
+// Accel 回報目前 worker 實際使用的推論裝置；沒有可用的 worker 時為空字串。
+func (s *Supervisor) Accel() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil || s.current.Dead() {
+		return ""
+	}
+	return s.current.Accel()
+}
+
 // Reason 回傳最近一次啟動失敗的原因代碼（StartupError.Reason）；沒有失敗或已恢復時為空字串。
 func (s *Supervisor) Reason() string { s.mu.Lock(); defer s.mu.Unlock(); return s.reason }
 

@@ -135,7 +135,18 @@ type Config struct {
 	Python, Script, Package, DictionarySHA256 string
 	Threads                                   int
 	Timeout                                   time.Duration
+	// Accel 是 worker 的硬體加速裝置：空字串或 AccelCPU 照舊只用 CPU（命令列與以前相同）；AccelNPU、AccelGPU 讓
+	// sequence_runtime.py 改用 OpenVINO 的 Intel NPU 或 GPU，裝置無法使用或不支援的請求仍走 CPU。
+	Accel string
 }
+
+// worker 的硬體加速裝置（Config.Accel、0c-server -neural-accel）。
+const (
+	AccelCPU = "cpu"
+	AccelNPU = "npu"
+	AccelGPU = "gpu"
+)
+
 type Manifest struct {
 	AllowPartial     bool              `json:"allow_partial"`
 	Schema           string            `json:"schema"`
@@ -214,6 +225,7 @@ type Worker struct {
 	timeout  time.Duration
 	next     uint64
 	stats    Stats
+	accel    string // worker 就緒時回報實際使用的裝置（AccelCPU／AccelGPU／AccelNPU）
 }
 
 func fileSHA(path string) (string, error) {
@@ -253,8 +265,16 @@ func Open(c Config) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := pythonCommand(c.Python, c.Script, "--package", c.Package, "--dictionary", c.DictionarySHA256, "--threads", fmt.Sprint(c.Threads))
+	cmd := pythonCommand(c.Python, c.Script, workerArgs(c)...)
 	return start(cmd, m, c.Timeout)
+}
+
+func workerArgs(c Config) []string {
+	args := []string{"--package", c.Package, "--dictionary", c.DictionarySHA256, "--threads", fmt.Sprint(c.Threads)}
+	if c.Accel == AccelNPU || c.Accel == AccelGPU {
+		args = append(args, "--accel", c.Accel) // CPU 不加：encoder_runtime.py 不認得這個參數
+	}
+	return args
 }
 
 // loadManifest 核對設定、套件契約、字典配對與模型雜湊；不啟動 worker。
@@ -265,6 +285,9 @@ func loadManifest(c Config) (Manifest, error) {
 	}
 	if c.Threads < 1 || c.Threads > MaxThreads {
 		return m, errors.New("invalid neural threads")
+	}
+	if c.Accel != "" && c.Accel != AccelCPU && c.Accel != AccelNPU && c.Accel != AccelGPU {
+		return m, errors.New("invalid neural accel")
 	}
 	b, err := os.ReadFile(filepath.Join(c.Package, "manifest.json"))
 	if err != nil {
@@ -350,6 +373,7 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 		Schema       string `json:"schema"`
 		Model        string `json:"model_sha256"`
 		Dictionary   string `json:"dictionary_sha256"`
+		Accel        string `json:"accel"`
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &ready)
@@ -360,8 +384,20 @@ func start(cmd *exec.Cmd, m Manifest, timeout time.Duration) (*Worker, error) {
 		return nil, startupError("neural worker", err, stderr.finish())
 	}
 	stderr.finish()
+	w.accel = readyAccel(ready.Accel)
 	return w, nil
 }
+
+// readyAccel 把就緒訊息的 accel 正規化：舊 worker 沒有這個欄位、或不認得的值，都當作 CPU。
+func readyAccel(v string) string {
+	if v == AccelGPU || v == AccelNPU {
+		return v
+	}
+	return AccelCPU
+}
+
+// Accel 回報 worker 實際使用的推論裝置（就緒時回報；之後 GPU／NPU 出錯改用 CPU 時不更新）。
+func (w *Worker) Accel() string { return w.accel }
 
 // exchange 至多有一個 I/O goroutine。逾時關閉管線並殺掉 worker，不排隊、不可晚套用。
 func (w *Worker) exchange(request []byte, timeout time.Duration) ([]byte, error) {

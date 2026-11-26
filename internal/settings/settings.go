@@ -123,8 +123,13 @@ type Settings struct {
 	CapsLockEnglish bool `json:"caps_lock_english"`
 	// Toneless：不打聲調也能選字（#150，聲調選填）。預設 false。開啟時沒打聲調的音節由解碼決定、有打的照聲調；
 	// 中英混打的自動判斷停用（與混打二選一），已儲存的 mixed_input 不動，關掉這一項就照舊。
-	Toneless bool  `json:"toneless"`
-	Fuzzy    Fuzzy `json:"fuzzy,omitzero"`
+	Toneless bool `json:"toneless"`
+	// NeuralAccel：神經選字的硬體加速（AccelCPU、AccelGPU、AccelNPU）。預設 cpu（缺欄位時也是）。gpu、npu 經
+	// onnxruntime 的 OpenVINO EP 用 Intel 內顯或 NPU；推論環境沒有 OpenVINO 或裝置無法使用時 worker 照舊用 CPU，
+	// health 的 selection_accel 回報實際使用的裝置。只有 Windows、Linux（NeuralAccelSetting）；macOS 沒有這一項。
+	// 只用統計引擎時不作用。
+	NeuralAccel string `json:"neural_accel"`
+	Fuzzy       Fuzzy  `json:"fuzzy,omitzero"`
 	// 0.2.0 開發期間的內部開關 preview_0_2（#128）已拿掉：自訂詞彙、加詞按鍵、「我的片語」、本機 API 等
 	// 入口 0.2.0 起所有人都有。舊檔裡的 preview_0_2 不論值為何都忽略，存檔時移除（retiredKeys）。
 
@@ -266,7 +271,8 @@ func (s Settings) FuzzyConfig() fuzzy.Config {
 
 func Default() Settings {
 	s := Settings{Selection: Neural, Punctuation: false, DocumentContext: true, CandidateCursor: defaultCandidateCursor(runtime.GOOS), CandidateLayout: "vertical", EmojiShortcut: "equals", EmojiEqualsFirst: true, EscClear: true, SpaceSelects: true, KeyboardLayout: LayoutStandard, SelectionKeys: SelectDigits, CtrlPunctuation: true, ZhuyinErrorHint: true, PersonalLearning: true,
-		ToggleKey: defaultToggleKey(runtime.GOOS), ShiftTapMS: DefaultShiftTapMS, ModeMemory: defaultModeMemory(runtime.GOOS), StartMode: StartZhuyin}
+		ToggleKey: defaultToggleKey(runtime.GOOS), ShiftTapMS: DefaultShiftTapMS, ModeMemory: defaultModeMemory(runtime.GOOS), StartMode: StartZhuyin,
+		NeuralAccel: AccelCPU}
 	s.LeftShift = s.TogglesLeft() // 舊欄位跟著切換鍵：Windows 預設左右 Shift 時是 true（#206）
 	return s
 }
@@ -431,6 +437,7 @@ func (s *Settings) UnmarshalJSON(b []byte) error {
 		{"toggle_key", &s.ToggleKey, []string{ToggleRight, ToggleBoth, ToggleLeft, ToggleNone}},
 		{"mode_memory", &s.ModeMemory, []string{ModeNative, ModeShared}},
 		{"start_mode", &s.StartMode, []string{StartZhuyin, StartEnglish}},
+		{"neural_accel", &s.NeuralAccel, []string{AccelCPU, AccelGPU, AccelNPU}},
 	} {
 		if raw, ok := take(field.key); ok {
 			var value string
@@ -512,7 +519,7 @@ func (s Settings) MarshalJSON() ([]byte, error) {
 	for _, field := range []struct {
 		key   string
 		value any
-	}{{"selection", s.Selection}, {"punctuation", s.Punctuation}, {"document_context", s.DocumentContext}, {"mixed_input", s.MixedInput}, {"english_autocomplete", s.EnglishAutocomplete}, {"left_shift", s.LeftShift}, {"esc_clear", s.EscClear}, {"space_selects", s.SpaceSelects}, {"candidate_cursor", s.CandidateCursor}, {"advance_after_select", s.AdvanceAfterSelect}, {"candidate_layout", s.CandidateLayout}, {"emoji_shortcut", s.EmojiShortcut}, {"emoji_equals_first", s.EmojiEqualsFirst}, {"keyboard_layout", s.KeyboardLayout}, {"selection_keys", s.SelectionKeys}, {"toggle_key", s.ToggleKey}, {"shift_tap_ms", s.ShiftTapMillis()}, {"mode_memory", s.ModeMemory}, {"start_mode", s.StartMode}, {"output_simplified", s.OutputSimplified}, {"simplified_hotkey", s.SimplifiedHotkey}, {"ctrl_punctuation", s.CtrlPunctuation}, {"shift_symbol_halfwidth", s.ShiftSymbolHalfwidth}, {"all_symbols_halfwidth", s.AllSymbolsHalfwidth}, {"cjk_latin_space", s.CJKLatinSpace}, {"zhuyin_error_hint", s.ZhuyinErrorHint}, {"personal_learning", s.PersonalLearning}, {"caps_lock_english", s.CapsLockEnglish}, {"toneless", s.Toneless}} {
+	}{{"selection", s.Selection}, {"punctuation", s.Punctuation}, {"document_context", s.DocumentContext}, {"mixed_input", s.MixedInput}, {"english_autocomplete", s.EnglishAutocomplete}, {"left_shift", s.LeftShift}, {"esc_clear", s.EscClear}, {"space_selects", s.SpaceSelects}, {"candidate_cursor", s.CandidateCursor}, {"advance_after_select", s.AdvanceAfterSelect}, {"candidate_layout", s.CandidateLayout}, {"emoji_shortcut", s.EmojiShortcut}, {"emoji_equals_first", s.EmojiEqualsFirst}, {"keyboard_layout", s.KeyboardLayout}, {"selection_keys", s.SelectionKeys}, {"toggle_key", s.ToggleKey}, {"shift_tap_ms", s.ShiftTapMillis()}, {"mode_memory", s.ModeMemory}, {"start_mode", s.StartMode}, {"output_simplified", s.OutputSimplified}, {"simplified_hotkey", s.SimplifiedHotkey}, {"ctrl_punctuation", s.CtrlPunctuation}, {"shift_symbol_halfwidth", s.ShiftSymbolHalfwidth}, {"all_symbols_halfwidth", s.AllSymbolsHalfwidth}, {"cjk_latin_space", s.CJKLatinSpace}, {"zhuyin_error_hint", s.ZhuyinErrorHint}, {"personal_learning", s.PersonalLearning}, {"caps_lock_english", s.CapsLockEnglish}, {"toneless", s.Toneless}, {"neural_accel", s.NeuralAccel}} {
 		if err := typed(field.key, field.value); err != nil {
 			return nil, err
 		}
@@ -567,7 +574,7 @@ func (s Settings) notes() []string {
 	if s.extra != "" {
 		_ = json.Unmarshal([]byte(s.extra), &kept)
 	}
-	for _, key := range []string{"selection", "punctuation", "document_context", "mixed_input", "english_autocomplete", "left_shift", "esc_clear", "space_selects", "candidate_cursor", "advance_after_select", "candidate_layout", "emoji_shortcut", "emoji_equals_first", "keyboard_layout", "selection_keys", "toggle_key", "shift_tap_ms", "mode_memory", "start_mode", "output_simplified", "simplified_hotkey", "ctrl_punctuation", "shift_symbol_halfwidth", "all_symbols_halfwidth", "cjk_latin_space", "zhuyin_error_hint", "personal_learning", "caps_lock_english", "toneless"} {
+	for _, key := range []string{"selection", "punctuation", "document_context", "mixed_input", "english_autocomplete", "left_shift", "esc_clear", "space_selects", "candidate_cursor", "advance_after_select", "candidate_layout", "emoji_shortcut", "emoji_equals_first", "keyboard_layout", "selection_keys", "toggle_key", "shift_tap_ms", "mode_memory", "start_mode", "output_simplified", "simplified_hotkey", "ctrl_punctuation", "shift_symbol_halfwidth", "all_symbols_halfwidth", "cjk_latin_space", "zhuyin_error_hint", "personal_learning", "caps_lock_english", "toneless", "neural_accel"} {
 		if raw, ok := kept[key]; ok {
 			out = append(out, fmt.Sprintf("%s：本版不認得 %s，暫用預設值，存檔時保留原值", strings.ReplaceAll(key, "_", "-"), raw))
 			delete(kept, key)
@@ -777,6 +784,8 @@ func (s Settings) valueLabels(key string) map[string]string {
 		return map[string]string{ModeNative: modeNativeLabel(runtime.GOOS, s.StartsEnglish()), ModeShared: "全部共用同一個模式"}
 	case "keyboard-layout":
 		return map[string]string{LayoutStandard: "標準", LayoutETen: "倚天 41 鍵", LayoutHsu: "許氏", LayoutPinyin: "漢語拼音"}
+	case "neural-accel":
+		return map[string]string{AccelCPU: "不使用（CPU）", AccelGPU: "Intel 內顯（GPU）", AccelNPU: "Intel NPU"}
 	case "shift-tap-ms": // #319
 		out := map[string]string{}
 		for _, ms := range ShiftTapChoices {
@@ -869,6 +878,10 @@ func (s Settings) disabledReasonOn(goos, key string) string {
 		if s.ToggleKey == ToggleNone {
 			return shiftTapUnusedReason
 		}
+	case "neural-accel":
+		if s.Selection == Statistical {
+			return accelStatisticalReason
+		}
 	case "zhuyin-error-hint":
 		// 聲調選填（#150）與中英混打（#78）有自己處理沒有字的注音的方式，這一項不作用（#300）。
 		// 兩者本身停用（倚天、許氏、所有符號鍵打半形、輸入習慣衝突）時照常；聲調選填開著時混打也停用，原因寫聲調選填。
@@ -897,6 +910,9 @@ const startModeLockedReason = "不用 Shift 切換時固定從注音開始"
 // shiftTapUnusedReason：不用 Shift 切換時，單按 Shift 的時限沒有作用（#319）。
 const shiftTapUnusedReason = "不用 Shift 切換時不作用"
 
+// accelStatisticalReason：只用統計引擎時不載入模型，硬體加速沒有作用。
+const accelStatisticalReason = "只用統計引擎時不作用"
+
 // disabledBy 回報停用原因來自哪一項設定（Item.DisabledBy）：設定程式把各項分在不同頁面（#207），
 // 原因那一項在別頁時，用它帶人過去改。新增停用原因時要一起加在這裡（TestDisabledItemsNameTheirCause）。
 func disabledBy(reason string) string {
@@ -914,6 +930,8 @@ func disabledBy(reason string) string {
 		return "shift-symbol-halfwidth"
 	case mixedSpaceReason, zhuyinHintMixedReason: // #288、#300
 		return "mixed-input"
+	case accelStatisticalReason:
+		return "selection"
 	}
 	return ""
 }
@@ -994,6 +1012,11 @@ func specs() []spec {
 	// #297：同上放在最後；設定程式排在「選字」頁的「打錯注音時提示」下面。
 	out = append(out, spec{"personal-learning", "記住我選的字詞", personalLearningDescription, "on", []string{"on", "off"},
 		func(s Settings) string { return onOff(s.PersonalLearning) }})
+	// 硬體加速：同上放在最後；設定程式排在「選字方式」下面。只有 Windows、Linux（NeuralAccelSetting）。
+	if NeuralAccelSetting(runtime.GOOS) {
+		out = append(out, spec{"neural-accel", "硬體加速", neuralAccelDescription, AccelCPU, []string{AccelCPU, AccelGPU, AccelNPU},
+			func(s Settings) string { return s.NeuralAccel }})
+	}
 	for _, p := range fuzzy.Pairs() {
 		out = append(out, spec{"fuzzy-" + p.ID(), "模糊音 " + p.Symbols(), "把近音的字也列進候選，原音仍排在前面；「自動修正」（實驗）會在上下文明顯支持近音時另外自動改字", DefaultFuzzy, []string{"off", "select", "auto"},
 			func(s Settings) string { return s.FuzzyConfig().Mode(p).String() }})
@@ -1019,6 +1042,30 @@ const tonelessDescription = "聲調可打可不打：ㄋㄧㄏㄠ 就是「你�
 // CapsLockEnglishSetting 回報這個平台有沒有「Caps Lock 開著時直接打英文」（#173）：Windows、Linux 有；
 // macOS 開 Caps Lock 一律切到英文大寫（#84、#67），沒有這一項，設定檔裡的值也不用。
 func CapsLockEnglishSetting(goos string) bool { return goos != "darwin" }
+
+// 神經選字的硬體加速（Settings.NeuralAccel；值與 internal/neural 的 Accel* 相同）。
+const (
+	AccelCPU = "cpu"
+	AccelGPU = "gpu"
+	AccelNPU = "npu"
+)
+
+// NeuralAccelSetting 回報這個平台有沒有「硬體加速」：Windows、Linux 有（Intel GPU、NPU 經 OpenVINO）；
+// macOS 沒有 OpenVINO 的 GPU、NPU 支援，沒有這一項，設定檔裡的值也不作用（EffectiveNeuralAccel）。
+func NeuralAccelSetting(goos string) bool { return goos != "darwin" }
+
+// EffectiveNeuralAccel 是引擎實際要求 worker 使用的加速裝置：平台沒有這一項時一律 cpu。
+func (s Settings) EffectiveNeuralAccel() string {
+	if !NeuralAccelSetting(runtime.GOOS) || s.NeuralAccel == "" {
+		return AccelCPU
+	}
+	return s.NeuralAccel
+}
+
+// neuralAccelDescription 是「硬體加速」的說明。
+const neuralAccelDescription = "神經選字改用 Intel 內顯或 NPU 計算，打字時的延遲較低、少占 CPU。需要 Intel 的顯示或 NPU 驅動，" +
+	"以及支援 OpenVINO 的推論元件；無法使用時自動改回 CPU，設定頁會顯示實際使用的裝置。內顯的結果與 CPU 相同；NPU 較省電，" +
+	"但部分較長的組字仍由 CPU 計算，結果與 CPU 略有差異"
 
 // SimplifiedHotkeyLabel 是切換「輸出簡體字」的快捷鍵（#192），設定說明與 0c-update 的文字用它；四個外殼各自比對同一組鍵。
 // 負責人在 Ctrl＋Shift＋F1～F12 裡選定 F11（#192）：兩個相鄰修飾鍵；撞到的只有冷門功能（Word 解除功能變數鎖定、
@@ -1359,6 +1406,9 @@ func (s *Settings) set(key, value string) error {
 	case "personal-learning":
 		s.PersonalLearning = value == "on"
 		s.forget("personal_learning")
+	case "neural-accel":
+		s.NeuralAccel = value
+		s.forget("neural_accel")
 	case "caps-lock-english":
 		s.CapsLockEnglish = value == "on"
 		s.forget("caps_lock_english")

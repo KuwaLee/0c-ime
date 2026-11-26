@@ -69,6 +69,7 @@ func serve() string {
 	neuralWorker := flag.String("neural-worker", "", "worker 腳本路徑（encoder_runtime.py 或 sequence_runtime.py）")
 	neuralTimeout := flag.Duration("neural-timeout", 100*time.Millisecond, "模型決策期限，上限 100ms；逾時保留原排序")
 	neuralThreads := flag.Int("neural-threads", neural.DefaultThreads(), "模型 CPU threads（1–8，預設為 CPU 邏輯核心數，最多 8）")
+	neuralAccel := flag.String("neural-accel", settings.AccelCPU, "神經選字的硬體加速：cpu、gpu 或 npu（Intel 內顯／NPU，需 onnxruntime 的 OpenVINO EP；無法使用時照舊走 CPU）；未指定時依 settings.json 的「硬體加速」")
 	punctPackage := flag.String("punct-package", "", "提交時補標點 ONNX 包；未指定時依 settings.json 使用資料包旁內附的 neural/punct")
 	punctWorker := flag.String("punct-worker", "", "補標點 worker 腳本路徑（punct_runtime.py）；Python 同 -neural-python")
 	punctTimeout := flag.Duration("punct-timeout", 150*time.Millisecond, "補標點期限，上限 500ms；逾時照原文提交")
@@ -281,6 +282,9 @@ func serve() string {
 			}
 		}
 	}
+	if !explicit["neural-accel"] {
+		*neuralAccel = config.EffectiveNeuralAccel()
+	}
 	if config.Punctuation && !explicit["punct-package"] && bundled.HasPunct {
 		*punctPackage, *punctWorker, *neuralPython = bundled.PunctPackage, bundled.PunctWorker, python
 		punctuationSource = bundled.PunctSource
@@ -294,7 +298,7 @@ func serve() string {
 		if workerErr == nil {
 			// 模型在背景載入；引擎先以統計引擎服務，外殼的第一個按鍵不必等 Python。
 			worker, workerErr = neural.OpenSupervisedAsync(neural.Config{Python: *neuralPython, Script: *neuralWorker, Package: *neuralPackage,
-				DictionarySHA256: dictionarySHA, Threads: *neuralThreads, Timeout: *neuralTimeout})
+				DictionarySHA256: dictionarySHA, Threads: *neuralThreads, Timeout: *neuralTimeout, Accel: *neuralAccel})
 		}
 		if workerErr != nil {
 			lg.Printf("神經模型未啟用，保留統計引擎：%v", workerErr)
@@ -311,7 +315,7 @@ func serve() string {
 			if selectionSource != "" && bundled.RuntimeMissing(false) {
 				neuralState = "runtime_missing" // 啟動時就知道沒有 python3；之後的狀態看 selection_state
 			}
-			lg.Printf("神經選字已啟用（背景載入模型）：%s（%d threads）", filepath.Base(*neuralPackage), *neuralThreads)
+			lg.Printf("神經選字已啟用（背景載入模型）：%s（%d threads，%s）", filepath.Base(*neuralPackage), *neuralThreads, *neuralAccel)
 		}
 	}
 	if *punctPackage != "" {
@@ -452,7 +456,7 @@ func serve() string {
 		"neural_startup_state": neuralState, "personal_store": personalState, "personal_lock": lockState,
 		"input_profile": config.ActiveProfile().ID, "input_profile_fingerprint": config.ProfileFingerprint(),
 		"input_style_shift_space": config.ProfileRules().ShiftSpace, "input_style_shift_letter": config.ProfileRules().ShiftLetter, "input_style_caps_letter": config.ProfileRules().CapsLetter,
-		"selection_setting": config.Selection, "punctuation": fmt.Sprint(eng.Punct != nil), "document_context": fmt.Sprint(config.DocumentContext),
+		"selection_setting": config.Selection, "neural_accel": *neuralAccel, "punctuation": fmt.Sprint(eng.Punct != nil), "document_context": fmt.Sprint(config.DocumentContext),
 		"fuzzy": eng.Fuzzy.Key(), "mixed_input": fmt.Sprint(config.MixedInput), "english_autocomplete": fmt.Sprint(config.EnglishAutocomplete), "left_shift": fmt.Sprint(config.TogglesLeft()), "right_shift": fmt.Sprint(config.TogglesRight()), "toggle_key": config.ToggleKey, "shift_tap_ms": fmt.Sprint(config.ShiftTapMillis()), "mode_memory": config.ModeMemory, "start_mode": config.EffectiveStartMode(), "esc_clear": fmt.Sprint(config.EscClear), "space_selects": fmt.Sprint(config.SpaceSelects), "advance_after_select": fmt.Sprint(config.AdvanceAfterSelect),
 		"selection_keys": config.SelectionKeys, "candidate_cursor": config.CandidateCursor, "candidate_layout": config.CandidateLayout, "emoji_shortcut": config.EmojiShortcut, "emoji_equals_first": fmt.Sprint(config.EmojiEqualsFirst),
 		"keyboard_layout": config.KeyboardLayout, "preview_0_2": fmt.Sprint(eng.Preview02), "vocab_state": vocabState,
@@ -539,6 +543,12 @@ func serve() string {
 			info[k] = v
 		}
 		// 退回時附上原因代碼（例如缺少系統元件），狀態摘要與設定程式據此說明；不含輸出內容。
+		// 硬體加速實際使用的裝置（worker 就緒時回報）：要求 gpu／npu 但推論環境或裝置不支援時是 cpu，設定程式據此說明。
+		if selectionState == "ready" && selectionWorker != nil {
+			if accel := selectionWorker.Accel(); accel != "" {
+				info["selection_accel"] = accel
+			}
+		}
 		if selectionState == "fallback" && selectionWorker != nil && selectionWorker.Reason() != "" {
 			info["selection_reason"] = selectionWorker.Reason()
 		}

@@ -30,7 +30,7 @@ Rust 的 `profile_command(action,id,name)` 只允許 `select`、`copy`、`rename
 | 頁面（`--page`） | 項目 |
 |---|---|
 | 中英切換（`mode`） | 中英切換鍵、單按 Shift 的時限、開始時的中英模式、切換視窗後的中英模式、中英混打、英文模式自動補字、Caps Lock 開著時直接打英文（Windows、Linux） |
-| 選字（`candidates`） | 選字方式（神經選字）、依前文選字、空白鍵選字、修改字詞的位置、選字後游標移到下一個字、選字排列、選字鍵、按 Esc 清除整段組字，另一張卡是模糊音總開關 |
+| 選字（`candidates`） | 選字方式（神經選字）、硬體加速（Windows、Linux）、依前文選字、空白鍵選字、修改字詞的位置、選字後游標移到下一個字、選字排列、選字鍵、按 Esc 清除整段組字，另一張卡是模糊音總開關 |
 | 鍵盤與符號（`keyboard`） | 鍵盤排列、Ctrl＋標點打全形、標點寬度、提交時補標點（Beta）、Emoji 選單（子選項「將 = 放在第一項」） |
 
 側欄順序：總覽、中英切換、選字、鍵盤與符號、輸出設定、我的詞彙、模型、更新、問題排解、關於。「輸出設定」（`output`）照舊獨立。契約裡不在任何一頁的新項目（較新的 0c-update 才有）畫在「選字」最後，所以新增設定不必先改畫面；要放別頁再加進 `INPUT_PAGES`。舊的頁名 `input`（0.2.5 以前的 `0c-update open-settings input`、說明文件）照樣接受，畫面導到側欄第一頁「中英切換」（`PAGE_ALIAS`；Go 與 Rust 的白名單也保留它，舊版設定程式照舊開輸入設定）。三份頁名清單由 `internal/settingsapp` 的 `TestPageNamesMatchTheSettingsApp` 核對。總覽的「有設定已儲存、尚未套用」帶到第一個尚未套用的項目所在的那一頁。
@@ -149,6 +149,8 @@ Windows 完整更新視窗驗收另有 `test/settings-update-test.ps1`：在沒�
 「打錯注音時提示」（`zhuyin-error-hint`，`settings.json` 的 `zhuyin_error_hint`，#300）預設開啟，排在「選字」頁的「不打聲調也能選字」之後。按了聲調但讀音沒有字時不收聲調、注音停住並提示（Windows、macOS 提示音，Linux 標示注音），緊接著再按一次同一個聲調照舊留下注音；只有一個注音符號（ㄟ、ㄅ＋空白）照舊直接留下。中英混打或不打聲調開著時反灰並附原因。不屬於輸入習慣風格。引擎讀設定，套用後生效。
 
 「記住我選的字詞」（`personal-learning`，`settings.json` 的 `personal_learning`，#297）預設開啟，排在「選字」頁的「打錯注音時提示」之後、輸入習慣的規則之前。關閉時照常選字（神經選字、依前文選字、已學到的照用），只是不再記下新的選擇、英文單字和最近用過的符號；「我的詞彙」照常。個人偏好，不屬於輸入習慣風格。引擎讀設定，套用後生效。
+
+「硬體加速」（`neural-accel`，`settings.json` 的 `neural_accel`）三選一：`cpu`（預設，舊設定檔沒有欄位時也是）、`gpu`（Intel 內顯）、`npu`（Intel NPU），只有 Windows、Linux；macOS 不列出，設定檔裡的值也不作用。畫在「選字」頁的「選字方式」下面，只用統計引擎時停用並指向它。推論元件沒有 OpenVINO、或驅動與裝置無法使用時 worker 照舊用 CPU；首頁的「神經選字」依 `selection_accel` 標出「Intel 內顯加速」「Intel NPU 加速」，要求了加速卻是 CPU 時寫「硬體加速無法使用，以 CPU 計算」。引擎讀設定，套用（引擎重啟）後生效。說明見 [神經推論](../neural/README.md)。
 
 輸入設定的「Caps Lock 開著時直接打英文」（`caps-lock-english`，`settings.json` 的 `caps_lock_english`）預設關閉，放在「中英切換」頁最後（#207），只有 Windows、Linux 有：macOS 開 Caps Lock 一律切到英文大寫（#84），`0c-update settings` 不列這一項，設定程式就不顯示。開啟時 Caps Lock 是暫時的英文模式（字母大寫、數字與符號半形，正在打的字先送出，關掉回到注音；先用 Shift 切到英文時只改大小寫）；關閉時注音模式不理 Caps Lock（#173、#168）。引擎讀設定，套用（引擎重啟）後生效；外殼依 health／open 的 `caps_lock_english` 決定要不要回報 Caps Lock 狀態。
 

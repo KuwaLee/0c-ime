@@ -414,6 +414,9 @@ func TestItemsListEveryKeyWithCurrentValue(t *testing.T) {
 	if CapsLockEnglishSetting(runtime.GOOS) {
 		want++ // caps-lock-english（#173）只有 Windows、Linux
 	}
+	if NeuralAccelSetting(runtime.GOOS) {
+		want++ // neural-accel 只有 Windows、Linux
+	}
 	if len(items) != want || items[0].Key != "selection" {
 		t.Fatalf("項目數量或順序不對：%+v", items)
 	}
